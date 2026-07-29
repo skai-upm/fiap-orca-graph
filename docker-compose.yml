@@ -1,0 +1,61 @@
+name: orca-graph
+
+services:
+  graphdb:
+    image: ontotext/graphdb:10.8.4
+    restart: unless-stopped
+    environment:
+      GDB_HEAP_SIZE: 2g
+    volumes:
+      - graphdb-data:/opt/graphdb/home
+    ports:
+      - "9092:7200"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7200/rest/repositories"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      GRAPHDB_URL: http://graphdb:7200
+      GRAPHDB_REPOSITORY: orca-graph
+      GLOBAL_GRAPH_URI: https://orca-graph.example/graph/global
+      PERSONAL_GRAPH_PREFIX: https://orca-graph.example/graph/users/
+      DATABASE_URL: sqlite+aiosqlite:////app/data/orca.db
+    volumes:
+      - orca-data:/app/data
+    depends_on:
+      graphdb:
+        condition: service_healthy
+    ports:
+      - "9091:8000"
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "9090:80"
+
+  backup:
+    build: ./backup
+    restart: unless-stopped
+    environment:
+      GRAPHDB_URL: http://graphdb:7200
+      GRAPHDB_REPOSITORY: orca-graph
+      BACKUP_DIR: /backups
+      BACKUP_INTERVAL_SECONDS: 86400
+      BACKUP_RETENTION_DAYS: 30
+    volumes:
+      - ./backups:/backups
+    depends_on:
+      graphdb:
+        condition: service_healthy
+
+volumes:
+  graphdb-data:
+  orca-data:
