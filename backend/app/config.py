@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     global_graph_uri: str = "https://orca-graph.example/graph/global"
     personal_graph_prefix: str = "https://orca-graph.example/graph/users/"
     ontology_path: Path = Path("/app/ontology/orca-graph.ttl")
+    om_ontology_path: Path = Path("/app/ontology/om-2.0.rdf")
+    om_graph_uri: str = "https://orca-graph.example/graph/ontology/om-2.0"
     database_url: str = "sqlite+aiosqlite:////app/data/orca.db"
     session_days: int = 7
     cookie_secure: bool = False

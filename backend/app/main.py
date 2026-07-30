@@ -25,14 +25,15 @@ from .domain import (
     NEW_NODE_SOURCE_RELATIONS,
     Node,
     NodeCreate,
+    NodeUpdate,
     NodeType,
-    OM_UNITS,
     PasswordChangeCommand,
     RelationCreate,
     RelationType,
     UnitOption,
     UserCreateCommand,
     UserPublic,
+    UserRole,
     validate_relation,
 )
 from .graphdb import graphdb
@@ -48,7 +49,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="ORCA Graph API", version="6.2.0", lifespan=lifespan)
+app = FastAPI(title="ORCA Graph API", version="7.11.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
@@ -114,16 +115,17 @@ async def create_user_account(
     command: UserCreateCommand,
     user: CurrentUser,
 ) -> UserPublic:
-    if user.role != "orca":
+    if user.role != UserRole.ADMIN.value:
         raise HTTPException(
             status_code=403,
-            detail="Solo la cuenta ORCA puede administrar usuarios",
+            detail="Solo las cuentas administradoras pueden administrar usuarios",
         )
     try:
         created = await create_or_reactivate_user(
             command.username,
             command.display_name,
             command.password,
+            command.role,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -140,15 +142,15 @@ async def create_user_account(
 
 @app.delete("/api/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_user_account(user_id: str, user: CurrentUser) -> None:
-    if user.role != "orca":
+    if user.role != UserRole.ADMIN.value:
         raise HTTPException(
             status_code=403,
-            detail="Solo la cuenta ORCA puede administrar usuarios",
+            detail="Solo las cuentas administradoras pueden administrar usuarios",
         )
     if user_id == user.id:
         raise HTTPException(
             status_code=400,
-            detail="La cuenta ORCA no puede eliminarse a sí misma",
+            detail="Una cuenta administradora no puede eliminarse a sí misma",
         )
     target = await get_user(user_id)
     if target is None:
@@ -168,7 +170,7 @@ async def delete_user_account(user_id: str, user: CurrentUser) -> None:
 
 @app.get("/api/units", response_model=list[UnitOption])
 async def units(_user: CurrentUser) -> list[UnitOption]:
-    return OM_UNITS
+    return await graphdb.units()
 
 
 @app.get("/api/model")
@@ -193,10 +195,13 @@ async def graph(user: CurrentUser) -> GraphSnapshot:
 
 @app.post("/api/nodes", response_model=Node, status_code=status.HTTP_201_CREATED)
 async def create_node(command: NodeCreate, user: CurrentUser) -> Node:
-    if command.type in {NodeType.VALUE_CHAIN, NodeType.VALUE_CHAIN_LINK} and user.role != "orca":
+    if (
+        command.type in {NodeType.VALUE_CHAIN, NodeType.VALUE_CHAIN_LINK}
+        and user.role not in {UserRole.ADMIN.value, UserRole.SPECIAL.value}
+    ):
         raise HTTPException(
             status_code=403,
-            detail="Only the ORCA account can create value chains or value-chain links",
+            detail="Solo los usuarios especiales o administradores pueden crear cadenas o eslabones",
         )
     parent_id = None
     relation = None
@@ -221,8 +226,6 @@ async def create_node(command: NodeCreate, user: CurrentUser) -> Node:
         name=command.name.strip(),
         description=command.description.strip(),
         definition=command.definition,
-        application_level=command.application_level,
-        application_scope=command.application_scope,
         unit_iri=command.unit_iri,
         support_agent_subtype=command.support_agent_subtype,
         parent_id=parent_id,
@@ -234,17 +237,8 @@ async def create_node(command: NodeCreate, user: CurrentUser) -> Node:
         name=command.name.strip(),
         description=command.description.strip(),
         definition=command.definition,
-        application_level=command.application_level,
-        application_scope=command.application_scope,
         unit_iri=command.unit_iri,
-        unit_label=next(
-            (
-                f"{unit.label} ({unit.symbol})"
-                for unit in OM_UNITS
-                if unit.iri == command.unit_iri
-            ),
-            None,
-        ),
+        unit_label=await graphdb.unit_label(command.unit_iri),
         support_agent_subtype=command.support_agent_subtype,
         graph=user.graph_uri,
         owner_id=user.id,
@@ -263,6 +257,48 @@ async def create_node(command: NodeCreate, user: CurrentUser) -> Node:
     return node
 
 
+@app.put("/api/nodes", response_model=Node)
+async def update_node(node_id: str, command: NodeUpdate, user: CurrentUser) -> Node:
+    existing = await graphdb.node(node_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Nodo no encontrado")
+    graph_uri, node_type = existing
+    if graph_uri != user.graph_uri:
+        raise HTTPException(status_code=403, detail="Solo puedes editar entidades creadas por ti")
+    try:
+        validated = NodeCreate(
+            type=node_type,
+            name=command.name,
+            description=command.description,
+            definition=command.definition,
+            unit_iri=command.unit_iri,
+            support_agent_subtype=command.support_agent_subtype,
+            parent={"parent_id": node_id, "relation": "similarTo"}
+            if node_type in {NodeType.KPI}
+            else {"parent_id": node_id, "relation": "belongsTo"}
+            if node_type in {NodeType.PRINCIPAL_AGENT}
+            else {"parent_id": node_id, "relation": "participatesInValueChainLink"}
+            if node_type in {NodeType.AUXILIARY_AGENT, NodeType.SUPPORT_AGENT, NodeType.VALUE_CHAIN_LINK}
+            else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    await graphdb.update_node(
+        graph_uri=graph_uri,
+        node_id=node_id,
+        node_type=node_type,
+        name=validated.name,
+        description=validated.description,
+        definition=validated.definition,
+        unit_iri=validated.unit_iri,
+        support_agent_subtype=validated.support_agent_subtype,
+    )
+    snapshot = await graphdb.snapshot(await list_users(include_inactive=True), user.id)
+    node = next(item for item in snapshot.nodes if item.id == node_id)
+    await hub.publish({"type": "graph.changed", "action": "node.updated", "actor": user.public().model_dump(), "node": node.model_dump()})
+    return node
+
+
 @app.post("/api/relations", status_code=status.HTTP_201_CREATED)
 async def create_relation(command: RelationCreate, user: CurrentUser) -> dict:
     source = await graphdb.node(command.source_id)
@@ -277,46 +313,25 @@ async def create_relation(command: RelationCreate, user: CurrentUser) -> dict:
         RelationType.HAS_VALUE_CHAIN_LINK,
         RelationType.IS_VALUE_CHAIN_LINK_OF,
         RelationType.PRECEDES,
-    } and user.role != "orca":
+    } and user.role not in {UserRole.ADMIN.value, UserRole.SPECIAL.value}:
         raise HTTPException(
             status_code=403,
-            detail="Only the ORCA account can modify value-chain structure",
+            detail="Solo los usuarios especiales o administradores pueden modificar la estructura de cadenas",
         )
-    kpi_id: str | None = None
-    application_relation: RelationType | None = None
-    if source[1] == NodeType.KPI and command.relation in {
-        RelationType.APPLIES_TO_VALUE_CHAIN_LINK,
-        RelationType.APPLIES_TO_AGENT,
-        RelationType.APPLIES_TO_SCOPE,
+    if command.relation in {
+        RelationType.HAS_VALUE_CHAIN_LINK,
+        RelationType.IS_VALUE_CHAIN_LINK_OF,
     }:
-        kpi_id = command.source_id
-        application_relation = command.relation
-    elif (
-        target[1] == NodeType.KPI
-        and source[1] == NodeType.SCOPE
-        and command.relation == RelationType.HAS_KPI
-    ):
-        kpi_id = command.target_id
-        application_relation = RelationType.APPLIES_TO_SCOPE
-    if kpi_id and application_relation:
-        existing = await graphdb.source_relation_types(kpi_id)
-        incompatible_by_relation = {
-            RelationType.APPLIES_TO_VALUE_CHAIN_LINK: {
-                RelationType.APPLIES_TO_AGENT
-            },
-            RelationType.APPLIES_TO_AGENT: {
-                RelationType.APPLIES_TO_VALUE_CHAIN_LINK
-            },
-            RelationType.APPLIES_TO_SCOPE: set(),
-        }
-        incompatible = incompatible_by_relation[application_relation]
-        if existing & incompatible:
+        chain_id, link_id = (
+            (command.source_id, command.target_id)
+            if command.relation == RelationType.HAS_VALUE_CHAIN_LINK
+            else (command.target_id, command.source_id)
+        )
+        existing_chain = await graphdb.value_chain_for_link(link_id)
+        if existing_chain is not None and existing_chain != chain_id:
             raise HTTPException(
-                status_code=422,
-                detail=(
-                    "A KPI cannot apply simultaneously to a value-chain link "
-                    "and directly to an auxiliary or support agent"
-                ),
+                status_code=409,
+                detail="Un eslabón solo puede pertenecer a una cadena de valor",
             )
     await graphdb.create_relation(
         graph_uri=user.graph_uri,

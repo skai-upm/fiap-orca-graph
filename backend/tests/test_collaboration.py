@@ -9,6 +9,7 @@ from app.domain import (
     RelationCreate,
     RelationType,
     UserCreateCommand,
+    UserRole,
 )
 from app.main import (
     change_password,
@@ -27,7 +28,7 @@ def demo_user() -> UserModel:
         username="test",
         display_name="Test User",
         initials="TU",
-        role="editor",
+        role=UserRole.NORMAL.value,
         graph_uri="https://orca-graph.example/graph/users/user-test",
         password_hash="not-used",
         active=True,
@@ -40,7 +41,7 @@ def orca_user() -> UserModel:
         username="orca",
         display_name="ORCA",
         initials="OR",
-        role="orca",
+        role=UserRole.ADMIN.value,
         graph_uri="https://orca-graph.example/graph/users/user-orca",
         password_hash="not-used",
         active=True,
@@ -97,36 +98,37 @@ async def test_invalid_cross_type_similarity_is_rejected(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_kpi_application_patterns_are_exclusive(monkeypatch):
+async def test_kpi_can_apply_to_link_and_agent_simultaneously(monkeypatch):
+    captured = {}
+
     async def fake_node(node_id):
         if node_id == "kpi":
             return "personal", NodeType.KPI
         return "global", NodeType.VALUE_CHAIN_LINK
 
-    async def fake_source_relation_types(_node_id):
-        return {RelationType.APPLIES_TO_AGENT}
+    async def fake_create_relation(**kwargs):
+        captured.update(kwargs)
+
+    async def fake_publish(_payload):
+        return None
 
     monkeypatch.setattr("app.main.graphdb.node", fake_node)
-    monkeypatch.setattr(
-        "app.main.graphdb.source_relation_types",
-        fake_source_relation_types,
+    monkeypatch.setattr("app.main.graphdb.create_relation", fake_create_relation)
+    monkeypatch.setattr("app.main.hub.publish", fake_publish)
+    result = await create_relation(
+        RelationCreate(
+            source_id="kpi",
+            target_id="link",
+            relation=RelationType.APPLIES_TO_VALUE_CHAIN_LINK,
+        ),
+        demo_user(),
     )
-
-    with pytest.raises(HTTPException) as error:
-        await create_relation(
-            RelationCreate(
-                source_id="kpi",
-                target_id="link",
-                relation=RelationType.APPLIES_TO_VALUE_CHAIN_LINK,
-            ),
-            demo_user(),
-        )
-
-    assert error.value.status_code == 422
+    assert captured["relation"] == RelationType.APPLIES_TO_VALUE_CHAIN_LINK
+    assert result["type"] == RelationType.APPLIES_TO_VALUE_CHAIN_LINK.value
 
 
 @pytest.mark.asyncio
-async def test_editor_cannot_create_value_chain():
+async def test_normal_user_cannot_create_value_chain():
     with pytest.raises(HTTPException) as error:
         await create_node(
             NodeCreate(
@@ -163,21 +165,47 @@ async def test_orca_account_can_create_value_chain(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_admin_role_cannot_create_value_chain():
+async def test_admin_role_can_create_value_chain(monkeypatch):
     user = demo_user()
-    user.role = "admin"
+    user.role = UserRole.ADMIN.value
 
-    with pytest.raises(HTTPException) as error:
-        await create_node(
-            NodeCreate(type=NodeType.VALUE_CHAIN, name="Admin chain"),
-            user,
-        )
+    async def fake_create_node(**_kwargs):
+        return None
 
-    assert error.value.status_code == 403
+    async def fake_publish(_payload):
+        return None
+
+    monkeypatch.setattr("app.main.graphdb.create_node", fake_create_node)
+    monkeypatch.setattr("app.main.hub.publish", fake_publish)
+    result = await create_node(
+        NodeCreate(type=NodeType.VALUE_CHAIN, name="Admin chain"),
+        user,
+    )
+    assert result.type == NodeType.VALUE_CHAIN
 
 
 @pytest.mark.asyncio
-async def test_only_orca_can_create_user(monkeypatch):
+async def test_special_role_can_create_value_chain(monkeypatch):
+    user = demo_user()
+    user.role = UserRole.SPECIAL.value
+
+    async def fake_create_node(**_kwargs):
+        return None
+
+    async def fake_publish(_payload):
+        return None
+
+    monkeypatch.setattr("app.main.graphdb.create_node", fake_create_node)
+    monkeypatch.setattr("app.main.hub.publish", fake_publish)
+    result = await create_node(
+        NodeCreate(type=NodeType.VALUE_CHAIN, name="Special chain"),
+        user,
+    )
+    assert result.type == NodeType.VALUE_CHAIN
+
+
+@pytest.mark.asyncio
+async def test_only_admin_can_create_user(monkeypatch):
     async def fake_create_user(*_args, **_kwargs):
         raise AssertionError("Persistence must not be called")
 
@@ -197,7 +225,7 @@ async def test_only_orca_can_create_user(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_orca_can_create_user(monkeypatch):
+async def test_admin_can_create_user(monkeypatch):
     created = demo_user()
     created.id = "new-user-id"
     created.username = "new-user"
@@ -327,16 +355,44 @@ async def test_editor_cannot_change_value_chain_topology(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_scope_to_kpi_is_allowed_alongside_agent_application(monkeypatch):
+async def test_link_cannot_belong_to_two_value_chains(monkeypatch):
+    async def fake_node(node_id):
+        return (
+            "personal",
+            NodeType.VALUE_CHAIN_LINK if node_id == "link-a" else NodeType.VALUE_CHAIN,
+        )
+
+    async def fake_value_chain_for_link(_link_id):
+        return "chain-existing"
+
+    monkeypatch.setattr("app.main.graphdb.node", fake_node)
+    monkeypatch.setattr(
+        "app.main.graphdb.value_chain_for_link",
+        fake_value_chain_for_link,
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await create_relation(
+            RelationCreate(
+                source_id="chain-new",
+                target_id="link-a",
+                relation=RelationType.HAS_VALUE_CHAIN_LINK,
+            ),
+            orca_user(),
+        )
+
+    assert error.value.status_code == 409
+    assert "solo puede pertenecer a una cadena" in error.value.detail
+
+
+@pytest.mark.asyncio
+async def test_component_to_kpi_is_allowed_alongside_agent_application(monkeypatch):
     captured = {}
 
     async def fake_node(node_id):
-        if node_id == "scope":
-            return "global", NodeType.SCOPE
+        if node_id == "component":
+            return "global", NodeType.COMPONENT
         return "personal", NodeType.KPI
-
-    async def fake_source_relation_types(_node_id):
-        return {RelationType.APPLIES_TO_AGENT}
 
     async def fake_create_relation(**kwargs):
         captured.update(kwargs)
@@ -345,16 +401,12 @@ async def test_scope_to_kpi_is_allowed_alongside_agent_application(monkeypatch):
         return None
 
     monkeypatch.setattr("app.main.graphdb.node", fake_node)
-    monkeypatch.setattr(
-        "app.main.graphdb.source_relation_types",
-        fake_source_relation_types,
-    )
     monkeypatch.setattr("app.main.graphdb.create_relation", fake_create_relation)
     monkeypatch.setattr("app.main.hub.publish", fake_publish)
 
     result = await create_relation(
         RelationCreate(
-            source_id="scope",
+            source_id="component",
             target_id="kpi",
             relation=RelationType.HAS_KPI,
         ),

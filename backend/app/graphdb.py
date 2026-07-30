@@ -7,15 +7,15 @@ from .config import settings
 from .domain import (
     INVERSE_RELATIONS,
     NEW_NODE_SOURCE_RELATIONS,
-    OM_UNITS,
+    OM,
     ORCA,
-    ApplicationLevel,
     GraphSnapshot,
     Node,
     NodeType,
     Relation,
     RelationType,
     SupportAgentSubtype,
+    UnitOption,
     UserPublic,
 )
 
@@ -96,6 +96,45 @@ class GraphDB:
             response = await client.post(settings.statements_url, data={"update": sparql})
             response.raise_for_status()
 
+    async def units(self) -> list[UnitOption]:
+        result = await self.query(
+            f"""
+            SELECT ?unit
+                   (SAMPLE(?preferredLabel) AS ?label)
+                   (SAMPLE(?unitSymbol) AS ?symbol)
+            WHERE {{
+              GRAPH {sparql_iri(settings.om_graph_uri)} {{
+                ?unit a ?unitClass .
+                ?unitClass <http://www.w3.org/2000/01/rdf-schema#subClassOf>*
+                  {sparql_iri(f"{OM}Unit")} .
+                OPTIONAL {{
+                  ?unit <http://www.w3.org/2000/01/rdf-schema#label> ?preferredLabel .
+                  FILTER(LANG(?preferredLabel) = "en" || LANG(?preferredLabel) = "" ||
+                         LANG(?preferredLabel) = "es")
+                }}
+                OPTIONAL {{ ?unit {sparql_iri(f"{OM}symbol")} ?unitSymbol }}
+              }}
+            }}
+            GROUP BY ?unit
+            ORDER BY LCASE(STR(COALESCE(?label, ?unit)))
+            """
+        )
+        options: list[UnitOption] = []
+        for row in result.get("results", {}).get("bindings", []):
+            iri = row["unit"]["value"]
+            label = row.get("label", {}).get("value") or iri.rsplit("/", 1)[-1]
+            symbol = row.get("symbol", {}).get("value", "")
+            options.append(UnitOption(iri=iri, label=label, symbol=symbol))
+        return options
+
+    async def unit_label(self, unit_iri: str | None) -> str | None:
+        if not unit_iri:
+            return None
+        for unit in await self.units():
+            if unit.iri == unit_iri:
+                return f"{unit.label} ({unit.symbol})" if unit.symbol else unit.label
+        return unit_iri.rsplit("/", 1)[-1]
+
     @staticmethod
     def node_type_iris() -> str:
         return ", ".join(sparql_iri(f"{ORCA}{item.value}") for item in NodeType)
@@ -125,7 +164,7 @@ class GraphDB:
               FILTER(?predicate IN (
                 {sparql_iri(RelationType.APPLIES_TO_VALUE_CHAIN_LINK.iri)},
                 {sparql_iri(RelationType.APPLIES_TO_AGENT.iri)},
-                {sparql_iri(RelationType.APPLIES_TO_SCOPE.iri)}
+                {sparql_iri(RelationType.APPLIES_TO_COMPONENT.iri)}
               ))
             }}
             """
@@ -143,8 +182,6 @@ class GraphDB:
         name: str,
         description: str,
         definition: str | None,
-        application_level: ApplicationLevel | None,
-        application_scope: str | None,
         unit_iri: str | None,
         parent_id: str | None,
         relation: RelationType | None,
@@ -158,16 +195,6 @@ class GraphDB:
         if definition:
             properties.append(
                 f"{sparql_iri(f'{ORCA}definition')} {sparql_string(definition)}"
-            )
-        if application_level:
-            properties.append(
-                f"{sparql_iri(f'{ORCA}hasApplicationLevel')} "
-                f"{sparql_iri(application_level.iri)}"
-            )
-        if application_scope:
-            properties.append(
-                f"{sparql_iri(f'{ORCA}applicationScope')} "
-                f"{sparql_string(application_scope)}"
             )
         if unit_iri:
             properties.append(
@@ -220,6 +247,90 @@ class GraphDB:
         relation: RelationType,
     ) -> None:
         triples = self.relation_triples(source_id, target_id, relation)
+        await self.update(
+            f"INSERT DATA {{ GRAPH {sparql_iri(graph_uri)} {{ {' '.join(triples)} }} }}"
+        )
+
+    async def value_chain_for_link(self, link_id: str) -> str | None:
+        result = await self.query(
+            f"""
+            SELECT DISTINCT ?chain WHERE {{
+              GRAPH ?graph {{
+                {{
+                  ?chain {sparql_iri(RelationType.HAS_VALUE_CHAIN_LINK.iri)}
+                  {sparql_iri(link_id)} .
+                }}
+                UNION
+                {{
+                  {sparql_iri(link_id)}
+                  {sparql_iri(RelationType.IS_VALUE_CHAIN_LINK_OF.iri)} ?chain .
+                }}
+              }}
+            }}
+            LIMIT 1
+            """
+        )
+        bindings = result.get("results", {}).get("bindings", [])
+        return bindings[0]["chain"]["value"] if bindings else None
+
+    async def update_node(
+        self,
+        graph_uri: str,
+        node_id: str,
+        node_type: NodeType,
+        name: str,
+        description: str,
+        definition: str | None,
+        unit_iri: str | None,
+        support_agent_subtype: SupportAgentSubtype | None,
+    ) -> None:
+        editable_properties = [
+            f"{ORCA}name", f"{ORCA}description", f"{ORCA}definition",
+            f"{ORCA}hasApplicationLevel", f"{ORCA}applicationScope",
+            f"{ORCA}unitOfMeasure",
+        ]
+        support_types = [
+            subtype.iri for subtype in SupportAgentSubtype
+            if subtype != SupportAgentSubtype.GENERAL
+        ]
+        filters = ", ".join(sparql_iri(item) for item in editable_properties)
+        type_filters = ", ".join(sparql_iri(item) for item in support_types)
+        await self.update(
+            f"""
+            DELETE {{
+              GRAPH {sparql_iri(graph_uri)} {{
+                {sparql_iri(node_id)} ?predicate ?value .
+                {sparql_iri(node_id)} a ?supportType .
+              }}
+            }}
+            WHERE {{
+              GRAPH {sparql_iri(graph_uri)} {{
+                OPTIONAL {{
+                  {sparql_iri(node_id)} ?predicate ?value .
+                  FILTER(?predicate IN ({filters}))
+                }}
+                OPTIONAL {{
+                  {sparql_iri(node_id)} a ?supportType .
+                  FILTER(?supportType IN ({type_filters}))
+                }}
+              }}
+            }}
+            """
+        )
+        properties = [f"{sparql_iri(f'{ORCA}name')} {sparql_string(name)}"]
+        if description:
+            properties.append(f"{sparql_iri(f'{ORCA}description')} {sparql_string(description)}")
+        if definition:
+            properties.append(f"{sparql_iri(f'{ORCA}definition')} {sparql_string(definition)}")
+        if unit_iri:
+            properties.append(f"{sparql_iri(f'{ORCA}unitOfMeasure')} {sparql_iri(unit_iri)}")
+        triples = [f"{sparql_iri(node_id)} " + " ; ".join(properties) + " ."]
+        if (
+            node_type == NodeType.SUPPORT_AGENT
+            and support_agent_subtype
+            and support_agent_subtype != SupportAgentSubtype.GENERAL
+        ):
+            triples.append(f"{sparql_iri(node_id)} a {sparql_iri(support_agent_subtype.iri)} .")
         await self.update(
             f"INSERT DATA {{ GRAPH {sparql_iri(graph_uri)} {{ {' '.join(triples)} }} }}"
         )
@@ -336,19 +447,13 @@ class GraphDB:
         node_result = await self.query(
             f"""
             SELECT ?graph ?id ?type ?name ?description ?definition
-                   ?applicationLevel ?applicationScope ?unit ?supportAgentSubtype
+                   ?unit ?supportAgentSubtype
             WHERE {{
               GRAPH ?graph {{
                 ?id a ?type ; {sparql_iri(f"{ORCA}name")} ?name .
                 FILTER(?type IN ({self.node_type_iris()}))
                 OPTIONAL {{ ?id {sparql_iri(f"{ORCA}description")} ?description }}
                 OPTIONAL {{ ?id {sparql_iri(f"{ORCA}definition")} ?definition }}
-                OPTIONAL {{
-                  ?id {sparql_iri(f"{ORCA}hasApplicationLevel")} ?applicationLevel
-                }}
-                OPTIONAL {{
-                  ?id {sparql_iri(f"{ORCA}applicationScope")} ?applicationScope
-                }}
                 OPTIONAL {{ ?id {sparql_iri(f"{ORCA}unitOfMeasure")} ?unit }}
                 OPTIONAL {{
                   ?id a ?supportAgentSubtype .
@@ -364,7 +469,10 @@ class GraphDB:
             }} ORDER BY ?name
             """
         )
-        unit_labels = {unit.iri: f"{unit.label} ({unit.symbol})" for unit in OM_UNITS}
+        unit_labels = {
+            unit.iri: f"{unit.label} ({unit.symbol})" if unit.symbol else unit.label
+            for unit in await self.units()
+        }
         nodes: list[Node] = []
         seen_ids: set[str] = set()
         for row in node_result["results"]["bindings"]:
@@ -375,7 +483,6 @@ class GraphDB:
             graph_uri = row["graph"]["value"]
             owner = user_by_graph.get(graph_uri)
             unit_iri = row.get("unit", {}).get("value")
-            level_iri = row.get("applicationLevel", {}).get("value")
             nodes.append(
                 Node(
                     id=node_id,
@@ -383,14 +490,11 @@ class GraphDB:
                     name=row["name"]["value"],
                     description=row.get("description", {}).get("value", ""),
                     definition=row.get("definition", {}).get("value"),
-                    application_level=(
-                        ApplicationLevel(level_iri.removeprefix(ORCA))
-                        if level_iri
-                        else None
-                    ),
-                    application_scope=row.get("applicationScope", {}).get("value"),
                     unit_iri=unit_iri,
-                    unit_label=unit_labels.get(unit_iri, unit_iri.rsplit("/", 1)[-1] if unit_iri else None),
+                    unit_label=unit_labels.get(
+                        unit_iri,
+                        unit_iri.rsplit("/", 1)[-1] if unit_iri else None,
+                    ),
                     support_agent_subtype=(
                         SupportAgentSubtype(
                             row["supportAgentSubtype"]["value"].removeprefix(ORCA)
@@ -411,7 +515,8 @@ class GraphDB:
             )
         node_ids = {node.id for node in nodes}
         visible_relation_types = {
-            RelationType.HAS_SUBSCOPE,
+            RelationType.HAS_COMPONENT,
+            RelationType.HAS_SUBCOMPONENT,
             RelationType.SIMILAR_TO,
             RelationType.HAS_VALUE_CHAIN_LINK,
             RelationType.BELONGS_TO,
@@ -419,6 +524,7 @@ class GraphDB:
             RelationType.APPLIES_TO_VALUE_CHAIN_LINK,
             RelationType.APPLIES_TO_AGENT,
             RelationType.HAS_KPI,
+            RelationType.HAS_ASSOCIATED_KPI,
             RelationType.PRECEDES,
         }
         relation_iris = ", ".join(
@@ -469,7 +575,7 @@ class GraphDB:
 
     async def seed_user_examples(self, users: list[UserPublic]) -> None:
         seed_graph = "https://orca-graph.example/graph/system-seed"
-        seed_marker = "https://orca-graph.example/system/seed/6.0.0"
+        seed_marker = "https://orca-graph.example/system/seed/7.0.0"
         seed_applied = "https://orca-graph.example/system/applied"
         exists = await self.query(
             f"ASK {{ GRAPH {sparql_iri(seed_graph)} {{ "
@@ -486,21 +592,45 @@ class GraphDB:
                 <{ORCA}name> "Circular fishing pilot" ;
                 <{ORCA}description> "Pilot value chain created by ORCA." ;
                 <{ORCA}hasValueChainLink>
-                <https://orca-graph.example/resource/link-resource-recovery> .
+                <https://orca-graph.example/resource/link-resource-recovery>,
+                <https://orca-graph.example/resource/link-primary-sector>,
+                <https://orca-graph.example/resource/link-marketer> .
               <https://orca-graph.example/resource/link-resource-recovery>
                 a <{ORCA}ValueChainLink> ;
                 <{ORCA}name> "Resource recovery" ;
                 <{ORCA}description> "Recovery and reuse of fishing by-products." ;
                 <{ORCA}isValueChainLinkOf>
                 <https://orca-graph.example/resource/value-chain-circular-pilot> .
+              <https://orca-graph.example/resource/link-primary-sector>
+                a <{ORCA}ValueChainLink> ;
+                <{ORCA}name> "Primary sector" ;
+                <{ORCA}description> "Primary extraction and production." ;
+                <{ORCA}isValueChainLinkOf>
+                <https://orca-graph.example/resource/value-chain-circular-pilot> ;
+                <{ORCA}precedes>
+                <https://orca-graph.example/resource/link-marketer> .
+              <https://orca-graph.example/resource/link-marketer>
+                a <{ORCA}ValueChainLink> ;
+                <{ORCA}name> "Marketer" ;
+                <{ORCA}description> "Marketing and initial distribution." ;
+                <{ORCA}isValueChainLinkOf>
+                <https://orca-graph.example/resource/value-chain-circular-pilot> .
             """,
             "user-andrea": f"""
-              <https://orca-graph.example/resource/scope-energy> a <{ORCA}Scope> ;
-                <{ORCA}name> "Energy" ;
-                <{ORCA}description> "Energy use and efficiency." .
               <https://orca-graph.example/resource/scope-sustainability>
-                <{ORCA}hasSubscope>
-                <https://orca-graph.example/resource/scope-energy> .
+                a <{ORCA}Scope> ;
+                <{ORCA}name> "Sustainability" ;
+                <{ORCA}description> "Sustainability scope created by Andrea." ;
+                <{ORCA}hasComponent>
+                <https://orca-graph.example/resource/component-energy> .
+              <https://orca-graph.example/resource/component-energy> a <{ORCA}Component> ;
+                <{ORCA}name> "Energy" ;
+                <{ORCA}description> "Energy use and efficiency." ;
+                <{ORCA}isComponentOf>
+                <https://orca-graph.example/resource/scope-sustainability> .
+              <https://orca-graph.example/resource/scope-sustainability>
+                <{ORCA}hasComponent>
+                <https://orca-graph.example/resource/component-energy> .
               <https://orca-graph.example/resource/agent-fishing-cooperative> a <{ORCA}PrincipalAgent> ;
                 <{ORCA}name> "Angolan fishing cooperative" ;
                 <{ORCA}belongsTo>
@@ -508,10 +638,10 @@ class GraphDB:
               <https://orca-graph.example/resource/kpi-energy> a <{ORCA}KPI> ;
                 <{ORCA}name> "Energy consumption" ;
                 <{ORCA}definition> "Total energy consumed during production." ;
-                <{ORCA}hasApplicationLevel> <{ORCA}Regional> ;
-                <{ORCA}applicationScope> "Community of Madrid" ;
                 <{ORCA}unitOfMeasure>
                 <http://www.ontology-of-units-of-measure.org/resource/om-2/kilowattHour> ;
+                <{ORCA}appliesToComponent>
+                <https://orca-graph.example/resource/component-energy> ;
                 <{ORCA}appliesToValueChainLink>
                 <https://orca-graph.example/resource/link-primary-sector> .
             """,
@@ -523,8 +653,6 @@ class GraphDB:
               <https://orca-graph.example/resource/kpi-delivery> a <{ORCA}KPI> ;
                 <{ORCA}name> "On-time delivery" ;
                 <{ORCA}definition> "Share of deliveries completed on time." ;
-                <{ORCA}hasApplicationLevel> <{ORCA}Provincial> ;
-                <{ORCA}applicationScope> "Province of Madrid" ;
                 <{ORCA}unitOfMeasure>
                 <http://www.ontology-of-units-of-measure.org/resource/om-2/percent> ;
                 <{ORCA}appliesToAgent>
@@ -554,75 +682,34 @@ class GraphDB:
                 headers={"Content-Type": "text/turtle"},
             )
             response.raise_for_status()
-        exists = await self.query(
-            f"ASK {{ GRAPH {sparql_iri(settings.global_graph_uri)} "
-            f"{{ ?s a {sparql_iri(f'{ORCA}Scope')} }} }}"
-        )
-        if exists.get("boolean"):
-            await self.seed_user_examples(users)
-            return
+            om_response = await client.put(
+                settings.statements_url,
+                params={"context": f"<{settings.om_graph_uri}>"},
+                content=settings.om_ontology_path.read_bytes(),
+                headers={"Content-Type": "application/rdf+xml"},
+            )
+            om_response.raise_for_status()
+        # Remove KPI properties retired in v7.10.0 from all user graphs.
         await self.update(
             f"""
-            INSERT DATA {{ GRAPH {sparql_iri(settings.global_graph_uri)} {{
-              <https://orca-graph.example/resource/scope-sustainability>
-                a <{ORCA}Scope> ;
-                <{ORCA}name> "Sustainability" ;
-                <{ORCA}description> "Shared sustainability scope." .
-              <https://orca-graph.example/resource/value-chain-angola-fishing>
-                a <{ORCA}ValueChain> ;
-                <{ORCA}name> "CadenaPescaAngola" ;
-                <{ORCA}description> "Cadena de valor precargada del sector pesquero de Angola." .
-              <https://orca-graph.example/resource/link-primary-sector>
-                a <{ORCA}ValueChainLink> ;
-                <{ORCA}name> "SectorPrimario" ;
-                <{ORCA}description> "Extracción y producción primaria de recursos pesqueros." .
-              <https://orca-graph.example/resource/link-marketer>
-                a <{ORCA}ValueChainLink> ;
-                <{ORCA}name> "Comercializadora" ;
-                <{ORCA}description> "Comercialización y distribución inicial del producto pesquero." .
-              <https://orca-graph.example/resource/link-intermediary>
-                a <{ORCA}ValueChainLink> ;
-                <{ORCA}name> "Intermediario" ;
-                <{ORCA}description> "Intermediación entre comercialización y destinos finales." .
-              <https://orca-graph.example/resource/link-final-consumer>
-                a <{ORCA}ValueChainLink> ;
-                <{ORCA}name> "ConsumidorFinal" ;
-                <{ORCA}description> "Consumo final del producto pesquero." .
-              <https://orca-graph.example/resource/link-transformation>
-                a <{ORCA}ValueChainLink> ;
-                <{ORCA}name> "Transformacion" ;
-                <{ORCA}description> "Procesado y transformación del producto pesquero." .
-              <https://orca-graph.example/resource/link-hospitality>
-                a <{ORCA}ValueChainLink> ;
-                <{ORCA}name> "Hosteleria" ;
-                <{ORCA}description> "Canal hostelero vinculado al producto pesquero." .
-
-              <https://orca-graph.example/resource/value-chain-angola-fishing>
-                <{ORCA}hasValueChainLink>
-                    <https://orca-graph.example/resource/link-primary-sector>,
-                    <https://orca-graph.example/resource/link-marketer>,
-                    <https://orca-graph.example/resource/link-intermediary>,
-                    <https://orca-graph.example/resource/link-final-consumer>,
-                    <https://orca-graph.example/resource/link-transformation>,
-                    <https://orca-graph.example/resource/link-hospitality> .
-
-              <https://orca-graph.example/resource/link-primary-sector>
-                <{ORCA}precedes> <https://orca-graph.example/resource/link-marketer> .
-              <https://orca-graph.example/resource/link-marketer>
-                <{ORCA}precedes>
-                    <https://orca-graph.example/resource/link-intermediary>,
-                    <https://orca-graph.example/resource/link-final-consumer>,
-                    <https://orca-graph.example/resource/link-transformation> .
-              <https://orca-graph.example/resource/link-intermediary>
-                <{ORCA}precedes>
-                    <https://orca-graph.example/resource/link-final-consumer>,
-                    <https://orca-graph.example/resource/link-transformation> .
-              <https://orca-graph.example/resource/link-transformation>
-                <{ORCA}precedes> <https://orca-graph.example/resource/link-final-consumer> .
-              <https://orca-graph.example/resource/link-hospitality>
-                <{ORCA}precedes> <https://orca-graph.example/resource/link-transformation> .
-            }} }}
+            DELETE {{ GRAPH ?graph {{ ?kpi ?predicate ?value }} }}
+            WHERE {{
+              GRAPH ?graph {{
+                ?kpi a {sparql_iri(f"{ORCA}KPI")} ;
+                     ?predicate ?value .
+                FILTER(?predicate IN (
+                  {sparql_iri(f"{ORCA}hasApplicationLevel")},
+                  {sparql_iri(f"{ORCA}applicationScope")}
+                ))
+              }}
+            }}
             """
+        )
+        # Versions before 7.5.0 inserted application entities into a global
+        # graph with no user owner. Remove that known legacy graph during the
+        # upgrade; all current seed entities live in a real user's named graph.
+        await self.update(
+            f"CLEAR SILENT GRAPH {sparql_iri(settings.global_graph_uri)}"
         )
         await self.seed_user_examples(users)
 

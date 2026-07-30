@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncAttrs, async_sessionmaker, create_async_
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from .config import settings
-from .domain import UserPublic
+from .domain import UserPublic, UserRole
 
 
 class Base(AsyncAttrs, DeclarativeBase):
@@ -23,7 +23,7 @@ class UserModel(Base):
     username: Mapped[str] = mapped_column(String(100), unique=True, index=True)
     display_name: Mapped[str] = mapped_column(String(200))
     initials: Mapped[str] = mapped_column(String(4))
-    role: Mapped[str] = mapped_column(String(30), default="editor")
+    role: Mapped[str] = mapped_column(String(30), default=UserRole.NORMAL.value)
     graph_uri: Mapped[str] = mapped_column(String(500), unique=True)
     password_hash: Mapped[str] = mapped_column(String(500))
     active: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -75,7 +75,7 @@ if settings.database_url.startswith("sqlite"):
         cursor.close()
 
 
-BOOTSTRAP_USERS_VERSION = "6.0.0"
+BOOTSTRAP_USERS_VERSION = "7.2.0"
 
 BOOTSTRAP_USERS = [
     {
@@ -83,7 +83,7 @@ BOOTSTRAP_USERS = [
         "username": "orca",
         "display_name": "ORCA",
         "initials": "OR",
-        "role": "orca",
+        "role": UserRole.ADMIN.value,
         "password": "orca123",
     },
     {
@@ -91,7 +91,7 @@ BOOTSTRAP_USERS = [
         "username": "andrea",
         "display_name": "Andrea Cimmino",
         "initials": "AC",
-        "role": "editor",
+        "role": UserRole.NORMAL.value,
         "password": "demo123",
     },
     {
@@ -99,7 +99,7 @@ BOOTSTRAP_USERS = [
         "username": "maria",
         "display_name": "María Pérez",
         "initials": "MP",
-        "role": "editor",
+        "role": UserRole.NORMAL.value,
         "password": "demo123",
     },
 ]
@@ -145,6 +145,13 @@ async def initialize_database() -> None:
                 )
             else:
                 marker.value = BOOTSTRAP_USERS_VERSION
+            existing_users = await session.execute(select(UserModel))
+            valid_roles = {role.value for role in UserRole}
+            for existing_user in existing_users.scalars().all():
+                if existing_user.role == "orca":
+                    existing_user.role = UserRole.ADMIN.value
+                elif existing_user.role not in valid_roles:
+                    existing_user.role = UserRole.NORMAL.value
         await session.commit()
 
 
@@ -224,6 +231,7 @@ async def create_or_reactivate_user(
     username: str,
     display_name: str,
     password: str,
+    role: UserRole,
 ) -> UserModel:
     normalized = username.strip().lower()
     async with SessionFactory() as session:
@@ -237,7 +245,7 @@ async def create_or_reactivate_user(
             existing.display_name = display_name.strip()
             existing.initials = initials_for(display_name)
             existing.password_hash = password_hasher.hash(password)
-            existing.role = "editor"
+            existing.role = role.value
             existing.active = True
             model = existing
         else:
@@ -247,7 +255,7 @@ async def create_or_reactivate_user(
                 username=normalized,
                 display_name=display_name.strip(),
                 initials=initials_for(display_name),
-                role="editor",
+                role=role.value,
                 graph_uri=f"{settings.personal_graph_prefix}{user_id}",
                 password_hash=password_hasher.hash(password),
                 active=True,

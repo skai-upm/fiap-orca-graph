@@ -2,7 +2,6 @@ import pytest
 
 from app.domain import (
     OM,
-    ApplicationLevel,
     NodeType,
     RelationType,
     SupportAgentSubtype,
@@ -11,20 +10,20 @@ from app.domain import (
 from app.graphdb import GraphDB
 
 
-def test_scope_kpi_relation_serializes_both_directions():
+def test_component_kpi_relation_serializes_both_directions():
     triples = GraphDB.relation_triples(
-        "https://example.org/scope",
+        "https://example.org/component",
         "https://example.org/kpi",
         RelationType.HAS_KPI,
     )
     joined = " ".join(triples)
-    assert "<https://example.org/scope>" in joined
+    assert "<https://example.org/component>" in joined
     assert "<https://orca-graph.example/ontology/hasKPI>" in joined
-    assert "<https://orca-graph.example/ontology/appliesToScope>" in joined
+    assert "<https://orca-graph.example/ontology/appliesToComponent>" in joined
 
 
 @pytest.mark.asyncio
-async def test_kpi_created_for_scope_uses_kpi_to_scope_direction(monkeypatch):
+async def test_kpi_created_for_component_uses_kpi_to_component_direction(monkeypatch):
     captured = {}
 
     async def fake_update(sparql):
@@ -39,21 +38,19 @@ async def test_kpi_created_for_scope_uses_kpi_to_scope_direction(monkeypatch):
         name="KPI",
         description="",
         definition="Definition",
-        application_level=ApplicationLevel.GENERAL,
-        application_scope="Angola",
         unit_iri=f"{OM}percent",
-        parent_id="https://example.org/scope",
-        relation=RelationType.APPLIES_TO_SCOPE,
+        parent_id="https://example.org/component",
+        relation=RelationType.APPLIES_TO_COMPONENT,
     )
 
     sparql = captured["sparql"]
     assert (
         "<https://example.org/kpi> "
-        "<https://orca-graph.example/ontology/appliesToScope> "
-        "<https://example.org/scope>"
+        "<https://orca-graph.example/ontology/appliesToComponent> "
+        "<https://example.org/component>"
     ) in sparql
     assert (
-        "<https://example.org/scope> "
+        "<https://example.org/component> "
         "<https://orca-graph.example/ontology/hasKPI> "
         "<https://example.org/kpi>"
     ) in sparql
@@ -75,8 +72,6 @@ async def test_support_agent_is_typed_as_base_class_and_selected_subclass(monkey
         name="Research centre",
         description="",
         definition=None,
-        application_level=None,
-        application_scope=None,
         unit_iri=None,
         parent_id="https://example.org/link",
         relation=RelationType.PARTICIPATES_IN_VALUE_CHAIN_LINK,
@@ -148,9 +143,9 @@ async def test_versioned_example_graph_has_contributions_from_each_user(monkeypa
             graph_uri=f"https://example.org/graph/{username}",
         )
         for user_id, username, display_name, initials, role in [
-            ("user-orca", "orca", "ORCA", "OR", "orca"),
-            ("user-andrea", "andrea", "Andrea Cimmino", "AC", "editor"),
-            ("user-maria", "maria", "María Pérez", "MP", "editor"),
+            ("user-orca", "orca", "ORCA", "OR", "admin"),
+            ("user-andrea", "andrea", "Andrea Cimmino", "AC", "normal"),
+            ("user-maria", "maria", "María Pérez", "MP", "normal"),
         ]
     ]
     client = GraphDB()
@@ -164,6 +159,6 @@ async def test_versioned_example_graph_has_contributions_from_each_user(monkeypa
     assert "GRAPH <https://example.org/graph/andrea>" in joined
     assert "GRAPH <https://example.org/graph/maria>" in joined
     assert "value-chain-circular-pilot" in joined
-    assert "scope-energy" in joined
+    assert "component-energy" in joined
     assert "kpi-delivery" in joined
-    assert "system/seed/6.0.0" in joined
+    assert "system/seed/7.0.0" in joined

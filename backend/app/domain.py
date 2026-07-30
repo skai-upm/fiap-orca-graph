@@ -9,6 +9,7 @@ OM = "http://www.ontology-of-units-of-measure.org/resource/om-2/"
 
 class NodeType(StrEnum):
     SCOPE = "Scope"
+    COMPONENT = "Component"
     KPI = "KPI"
     VALUE_CHAIN = "ValueChain"
     VALUE_CHAIN_LINK = "ValueChainLink"
@@ -17,15 +18,10 @@ class NodeType(StrEnum):
     SUPPORT_AGENT = "SupportAgent"
 
 
-class ApplicationLevel(StrEnum):
-    GENERAL = "General"
-    REGIONAL = "Regional"
-    PROVINCIAL = "Provincial"
-    LOCALITY = "Locality"
-
-    @property
-    def iri(self) -> str:
-        return f"{ORCA}{self.value}"
+class UserRole(StrEnum):
+    ADMIN = "admin"
+    SPECIAL = "special"
+    NORMAL = "normal"
 
 
 class SupportAgentSubtype(StrEnum):
@@ -42,8 +38,10 @@ class SupportAgentSubtype(StrEnum):
 
 
 class RelationType(StrEnum):
-    HAS_SUBSCOPE = "hasSubscope"
-    HAS_SUPERSCOPE = "hasSuperscope"
+    HAS_COMPONENT = "hasComponent"
+    IS_COMPONENT_OF = "isComponentOf"
+    HAS_SUBCOMPONENT = "hasSubcomponent"
+    HAS_SUPERCOMPONENT = "hasSupercomponent"
     SIMILAR_TO = "similarTo"
     HAS_VALUE_CHAIN_LINK = "hasValueChainLink"
     IS_VALUE_CHAIN_LINK_OF = "isValueChainLinkOf"
@@ -53,8 +51,9 @@ class RelationType(StrEnum):
     HAS_PARTICIPATING_AGENT = "hasParticipatingAgent"
     APPLIES_TO_VALUE_CHAIN_LINK = "appliesToValueChainLink"
     APPLIES_TO_AGENT = "appliesToAgent"
-    APPLIES_TO_SCOPE = "appliesToScope"
+    APPLIES_TO_COMPONENT = "appliesToComponent"
     HAS_KPI = "hasKPI"
+    HAS_ASSOCIATED_KPI = "hasAssociatedKPI"
     PRECEDES = "precedes"
 
     @property
@@ -63,16 +62,20 @@ class RelationType(StrEnum):
 
 
 INVERSE_RELATIONS: dict[RelationType, RelationType] = {
-    RelationType.HAS_SUBSCOPE: RelationType.HAS_SUPERSCOPE,
-    RelationType.HAS_SUPERSCOPE: RelationType.HAS_SUBSCOPE,
+    RelationType.HAS_COMPONENT: RelationType.IS_COMPONENT_OF,
+    RelationType.IS_COMPONENT_OF: RelationType.HAS_COMPONENT,
+    RelationType.HAS_SUBCOMPONENT: RelationType.HAS_SUPERCOMPONENT,
+    RelationType.HAS_SUPERCOMPONENT: RelationType.HAS_SUBCOMPONENT,
     RelationType.HAS_VALUE_CHAIN_LINK: RelationType.IS_VALUE_CHAIN_LINK_OF,
     RelationType.IS_VALUE_CHAIN_LINK_OF: RelationType.HAS_VALUE_CHAIN_LINK,
     RelationType.BELONGS_TO: RelationType.HAS_PRINCIPAL_AGENT,
     RelationType.HAS_PRINCIPAL_AGENT: RelationType.BELONGS_TO,
     RelationType.PARTICIPATES_IN_VALUE_CHAIN_LINK: RelationType.HAS_PARTICIPATING_AGENT,
     RelationType.HAS_PARTICIPATING_AGENT: RelationType.PARTICIPATES_IN_VALUE_CHAIN_LINK,
-    RelationType.APPLIES_TO_SCOPE: RelationType.HAS_KPI,
-    RelationType.HAS_KPI: RelationType.APPLIES_TO_SCOPE,
+    RelationType.APPLIES_TO_COMPONENT: RelationType.HAS_KPI,
+    RelationType.HAS_KPI: RelationType.APPLIES_TO_COMPONENT,
+    RelationType.APPLIES_TO_AGENT: RelationType.HAS_ASSOCIATED_KPI,
+    RelationType.HAS_ASSOCIATED_KPI: RelationType.APPLIES_TO_AGENT,
 }
 
 NEW_NODE_SOURCE_RELATIONS = {
@@ -80,19 +83,20 @@ NEW_NODE_SOURCE_RELATIONS = {
     RelationType.PARTICIPATES_IN_VALUE_CHAIN_LINK,
     RelationType.APPLIES_TO_VALUE_CHAIN_LINK,
     RelationType.APPLIES_TO_AGENT,
-    RelationType.APPLIES_TO_SCOPE,
+    RelationType.APPLIES_TO_COMPONENT,
 }
 
 
 ALLOWED_RELATIONS: dict[tuple[NodeType, NodeType], set[RelationType]] = {
-    (NodeType.SCOPE, NodeType.SCOPE): {
-        RelationType.HAS_SUBSCOPE,
-        RelationType.HAS_SUPERSCOPE,
-        RelationType.SIMILAR_TO,
+    (NodeType.SCOPE, NodeType.COMPONENT): {RelationType.HAS_COMPONENT},
+    (NodeType.COMPONENT, NodeType.SCOPE): {RelationType.IS_COMPONENT_OF},
+    (NodeType.COMPONENT, NodeType.COMPONENT): {
+        RelationType.HAS_SUBCOMPONENT,
+        RelationType.HAS_SUPERCOMPONENT,
     },
-    (NodeType.SCOPE, NodeType.KPI): {RelationType.HAS_KPI},
+    (NodeType.COMPONENT, NodeType.KPI): {RelationType.HAS_KPI},
     (NodeType.KPI, NodeType.KPI): {RelationType.SIMILAR_TO},
-    (NodeType.KPI, NodeType.SCOPE): {RelationType.APPLIES_TO_SCOPE},
+    (NodeType.KPI, NodeType.COMPONENT): {RelationType.APPLIES_TO_COMPONENT},
     (NodeType.VALUE_CHAIN, NodeType.VALUE_CHAIN_LINK): {
         RelationType.HAS_VALUE_CHAIN_LINK
     },
@@ -126,8 +130,20 @@ ALLOWED_RELATIONS: dict[tuple[NodeType, NodeType], set[RelationType]] = {
     (NodeType.KPI, NodeType.AUXILIARY_AGENT): {
         RelationType.APPLIES_TO_AGENT
     },
+    (NodeType.KPI, NodeType.PRINCIPAL_AGENT): {
+        RelationType.APPLIES_TO_AGENT
+    },
     (NodeType.KPI, NodeType.SUPPORT_AGENT): {
         RelationType.APPLIES_TO_AGENT
+    },
+    (NodeType.PRINCIPAL_AGENT, NodeType.KPI): {
+        RelationType.HAS_ASSOCIATED_KPI
+    },
+    (NodeType.AUXILIARY_AGENT, NodeType.KPI): {
+        RelationType.HAS_ASSOCIATED_KPI
+    },
+    (NodeType.SUPPORT_AGENT, NodeType.KPI): {
+        RelationType.HAS_ASSOCIATED_KPI
     },
 }
 
@@ -142,8 +158,6 @@ class NodeCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     description: str = Field(default="", max_length=2000)
     definition: str | None = Field(default=None, max_length=2000)
-    application_level: ApplicationLevel | None = None
-    application_scope: str | None = Field(default=None, max_length=500)
     unit_iri: str | None = Field(default=None, max_length=500)
     support_agent_subtype: SupportAgentSubtype | None = None
     parent: ParentLink | None = None
@@ -154,17 +168,12 @@ class NodeCreate(BaseModel):
         self.description = self.description.strip()
         if not self.name:
             raise ValueError("Name is required")
-        if self.type == NodeType.SCOPE and not self.description:
-            raise ValueError("A scope requires a description")
+        if self.type in {NodeType.SCOPE, NodeType.COMPONENT} and not self.description:
+            raise ValueError(f"A {self.type.value.lower()} requires a description")
         if self.type == NodeType.KPI:
             self.definition = (self.definition or "").strip()
-            self.application_scope = (self.application_scope or "").strip()
             if not self.definition:
                 raise ValueError("A KPI requires a definition")
-            if self.application_level is None:
-                raise ValueError("A KPI requires an application level")
-            if not self.application_scope:
-                raise ValueError("A KPI requires a free-text application scope")
             if not self.unit_iri:
                 raise ValueError("A KPI requires an OM unit")
             if not self.unit_iri.startswith(OM):
@@ -176,15 +185,21 @@ class NodeCreate(BaseModel):
         elif self.support_agent_subtype is not None:
             raise ValueError("Only a support agent can have a support-agent subtype")
         required_parent = {
-            NodeType.VALUE_CHAIN_LINK,
             NodeType.PRINCIPAL_AGENT,
             NodeType.AUXILIARY_AGENT,
             NodeType.SUPPORT_AGENT,
-            NodeType.KPI,
         }
         if self.type in required_parent and self.parent is None:
             raise ValueError(f"{self.type.value} requires a compatible relation")
         return self
+
+
+class NodeUpdate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    description: str = Field(default="", max_length=2000)
+    definition: str | None = Field(default=None, max_length=2000)
+    unit_iri: str | None = Field(default=None, max_length=500)
+    support_agent_subtype: SupportAgentSubtype | None = None
 
 
 class RelationCreate(BaseModel):
@@ -205,8 +220,6 @@ class Node(BaseModel):
     name: str
     description: str = ""
     definition: str | None = None
-    application_level: ApplicationLevel | None = None
-    application_scope: str | None = None
     unit_iri: str | None = None
     unit_label: str | None = None
     support_agent_subtype: SupportAgentSubtype | None = None
@@ -239,18 +252,6 @@ class UnitOption(BaseModel):
     symbol: str
 
 
-OM_UNITS = [
-    UnitOption(iri=f"{OM}one", label="Dimensionless", symbol="1"),
-    UnitOption(iri=f"{OM}percent", label="Percent", symbol="%"),
-    UnitOption(iri=f"{OM}kilogram", label="Kilogram", symbol="kg"),
-    UnitOption(iri=f"{OM}tonne", label="Tonne", symbol="t"),
-    UnitOption(iri=f"{OM}degreeCelsius", label="Degree Celsius", symbol="°C"),
-    UnitOption(iri=f"{OM}kilowattHour", label="Kilowatt hour", symbol="kWh"),
-    UnitOption(iri=f"{OM}euro", label="Euro", symbol="EUR"),
-    UnitOption(iri=f"{OM}second-Time", label="Second", symbol="s"),
-]
-
-
 class UserPublic(BaseModel):
     id: str
     username: str
@@ -273,6 +274,7 @@ class UserCreateCommand(BaseModel):
     )
     display_name: str = Field(min_length=2, max_length=200)
     password: str = Field(min_length=8, max_length=200)
+    role: UserRole = UserRole.NORMAL
 
 
 class PasswordChangeCommand(BaseModel):

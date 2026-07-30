@@ -3,7 +3,6 @@ from pydantic import ValidationError
 
 from app.domain import (
     OM,
-    ApplicationLevel,
     NodeCreate,
     NodeType,
     ParentLink,
@@ -14,9 +13,9 @@ from app.domain import (
 )
 
 
-def test_scope_hierarchy_and_similarity_are_valid():
-    validate_relation(NodeType.SCOPE, NodeType.SCOPE, RelationType.HAS_SUBSCOPE)
-    validate_relation(NodeType.SCOPE, NodeType.SCOPE, RelationType.SIMILAR_TO)
+def test_scope_component_and_component_hierarchy_are_valid():
+    validate_relation(NodeType.SCOPE, NodeType.COMPONENT, RelationType.HAS_COMPONENT)
+    validate_relation(NodeType.COMPONENT, NodeType.COMPONENT, RelationType.HAS_SUBCOMPONENT)
 
 
 def test_similarity_cannot_cross_scope_and_kpi():
@@ -45,11 +44,11 @@ def test_value_chain_and_agent_relations():
 def test_kpi_target_rules():
     validate_relation(
         NodeType.KPI,
-        NodeType.SCOPE,
-        RelationType.APPLIES_TO_SCOPE,
+        NodeType.COMPONENT,
+        RelationType.APPLIES_TO_COMPONENT,
     )
     validate_relation(
-        NodeType.SCOPE,
+        NodeType.COMPONENT,
         NodeType.KPI,
         RelationType.HAS_KPI,
     )
@@ -63,12 +62,16 @@ def test_kpi_target_rules():
         NodeType.SUPPORT_AGENT,
         RelationType.APPLIES_TO_AGENT,
     )
-    with pytest.raises(ValueError):
-        validate_relation(
-            NodeType.KPI,
-            NodeType.PRINCIPAL_AGENT,
-            RelationType.APPLIES_TO_AGENT,
-        )
+    validate_relation(
+        NodeType.KPI,
+        NodeType.PRINCIPAL_AGENT,
+        RelationType.APPLIES_TO_AGENT,
+    )
+    validate_relation(
+        NodeType.PRINCIPAL_AGENT,
+        NodeType.KPI,
+        RelationType.HAS_ASSOCIATED_KPI,
+    )
 
 
 def test_value_chain_links_can_be_ordered():
@@ -79,22 +82,16 @@ def test_value_chain_links_can_be_ordered():
     )
 
 
-def test_kpi_requires_definition_level_scope_unit_and_target():
+def test_kpi_requires_definition_and_om_unit_but_can_add_relations_after_creation():
     with pytest.raises(ValidationError):
         NodeCreate(type=NodeType.KPI, name="Incomplete KPI")
     command = NodeCreate(
         type=NodeType.KPI,
         name="Recycling rate",
         definition="Share of recycled waste.",
-        application_level=ApplicationLevel.REGIONAL,
-        application_scope="Community of Madrid",
         unit_iri=f"{OM}percent",
-        parent=ParentLink(
-            parent_id="https://example.org/link",
-            relation=RelationType.APPLIES_TO_VALUE_CHAIN_LINK,
-        ),
     )
-    assert command.application_level == ApplicationLevel.REGIONAL
+    assert command.unit_iri == f"{OM}percent"
 
 
 def test_scope_requires_name_and_description():
@@ -138,3 +135,12 @@ def test_non_support_agent_rejects_support_subtype():
             description="Description",
             support_agent_subtype=SupportAgentSubtype.RESEARCH,
         )
+
+
+def test_value_chain_link_can_be_created_before_order_relations_are_added():
+    command = NodeCreate(
+        type=NodeType.VALUE_CHAIN_LINK,
+        name="Transformación",
+        description="Procesamiento del producto",
+    )
+    assert command.parent is None

@@ -1,7 +1,7 @@
 {
   "name": "orca-graph-frontend",
   "private": true,
-  "version": "6.2.0",
+  "version": "7.11.0",
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
@@ -11,7 +11,8 @@
     "cytoscape": "^3.33.1",
     "lucide-react": "^0.468.0",
     "react": "^19.1.1",
-    "react-dom": "^19.1.1"
+    "react-dom": "^19.1.1",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@types/cytoscape": "^3.21.9",

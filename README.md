@@ -1,4 +1,4 @@
-# ORCA Graph
+# ORCA Graph v7.11.0
 
 **Ontology-Restricted Collaborative Authoring of Graphs**
 
@@ -6,21 +6,42 @@ ORCA Graph is a collaborative editor for knowledge graphs governed by a fixed
 ontology. It combines a React/Cytoscape.js interface, a FastAPI backend,
 SQLite-based authentication and GraphDB RDF persistence.
 
-## Semantic model v8.2
+Version 7.11.0 lets value-chain links manage their associated KPIs, removes the
+Relations section from the data sidebar and exports the six entity tables plus
+a dedicated IRIs sheet to Excel. It retains the complete OM 2.0 ontology in an
+independent GraphDB named graph and its unit search by name, symbol or IRI.
+Version 7.9.0 added specialised Agent and KPI tables, removed the redundant type
+column from entity tables and Excel exports, and introduces searchable
+multi-select relationship fields for Agent-KPI, Agent-Link, KPI-Component,
+KPI-Agent and KPI-Link associations. Creation and editing use the same
+author-aware controls. It retains the specialised scope, component, value-chain
+and value-chain-link tables, with
+coloured pills for chain membership and preceding/following links. Version
+7.6.0 added specialised value-chain forms, explicit graph navigation, and
+removes legacy unowned seed entities. Version 7.4.0 added entity-specific creation forms, searchable multi-select
+controls with removable tags, a unified agent form with conditional subtype,
+and multiple link/component relationships. Version 7.3.0 added ownership-aware
+edit and delete actions to every entity
+table. It also exports the complete data workspace to one Excel workbook with
+separate sheets for chains, links, scopes, components, agents, KPI and
+relations.
+
+## Semantic model v7
 
 | Source | Relation | Target |
 |---|---|---|
-| `orca:Scope` | `orca:hasSubscope` | `orca:Scope` |
-| `orca:Scope` | `orca:similarTo` | `orca:Scope` |
+| `orca:Scope` | `orca:hasComponent` | `orca:Component` |
+| `orca:Component` | `orca:hasSubcomponent` | `orca:Component` |
+| `orca:Component` | `orca:hasKPI` | `orca:KPI` |
+| `orca:KPI` | `orca:appliesToComponent` | `orca:Component` |
 | `orca:KPI` | `orca:similarTo` | `orca:KPI` |
 | `orca:ValueChain` | `orca:hasValueChainLink` | `orca:ValueChainLink` |
 | `orca:PrincipalAgent` | `orca:belongsTo` | `orca:ValueChainLink` |
 | `orca:AuxiliaryAgent` | `orca:participatesInValueChainLink` | `orca:ValueChainLink` |
 | `orca:SupportAgent` | `orca:participatesInValueChainLink` | `orca:ValueChainLink` |
 | `orca:KPI` | `orca:appliesToValueChainLink` | `orca:ValueChainLink` |
-| `orca:KPI` | `orca:appliesToAgent` | `orca:AuxiliaryAgent` or `orca:SupportAgent` |
-| `orca:KPI` | `orca:appliesToScope` | `orca:Scope` |
-| `orca:Scope` | `orca:hasKPI` | `orca:KPI` |
+| `orca:KPI` | `orca:appliesToAgent` | `orca:Agent` |
+| `orca:Agent` | `orca:hasAssociatedKPI` | `orca:KPI` |
 | `orca:ValueChainLink` | `orca:precedes` | `orca:ValueChainLink` |
 
 The ontology uses English IRIs and bilingual `rdfs:label` and `rdfs:comment`
@@ -29,8 +50,10 @@ annotations. Names, descriptions and KPI definitions use the custom properties
 
 These rules are enforced by both the GUI and API:
 
-- A `Scope` may be a root scope or a subscope of another `Scope`.
-- `similarTo` is symmetric and only connects two scopes or two KPIs.
+- A `Scope` relates to zero or more components and is not hierarchical.
+- Components may form a hierarchy through `hasSubcomponent`.
+- KPI classification uses components, never scopes.
+- `similarTo` is symmetric and connects two KPIs.
 - A value chain link requires a value chain.
 - A principal agent belongs to a value-chain link.
 - Auxiliary and support agents participate in a value-chain link.
@@ -38,16 +61,16 @@ These rules are enforced by both the GUI and API:
   Government support agents may additionally be national or regional. These
   categories are modeled as an OWL subclass hierarchy and selected through a
   controlled dropdown when the node is created.
-- Every KPI requires a name, definition, application level, free-text
-  application scope and one OM 2 unit.
-- A KPI may be related to one or more scopes independently of its operational
-  target. For operational targets, value-chain links and direct
-  auxiliary/support agents remain mutually exclusive.
-- `orca:hasKPI` and `orca:appliesToScope` are inverse properties. The GUI
-  displays one canonical `Scope -> KPI` arrow regardless of the direction used
+- Every KPI requires a name, definition and one OM 2 unit.
+- OM 2.0 is stored in the named graph
+  `https://orca-graph.example/graph/ontology/om-2.0`.
+- A KPI may be related simultaneously to components, value-chain links and
+  agents of any type.
+- `orca:hasKPI` and `orca:appliesToComponent` are inverse properties. The GUI
+  displays one canonical `Component -> KPI` arrow regardless of the direction used
   to create the assertion.
+- `orca:appliesToAgent` and `orca:hasAssociatedKPI` are inverse properties.
 - The deployed software version is always displayed in the HTML footer.
-- A KPI cannot apply directly to a principal agent.
 - Self-relations are rejected.
 - Inverse structural relations are written automatically.
 
@@ -74,7 +97,10 @@ The backend follows these rules:
 - Deleting an owned node also removes every incoming and outgoing ontology
   relation across all personal graphs.
 - WebSocket events refresh every connected browser after a committed change.
-- Only the ORCA account can create or permanently delete application users.
+- Administrator accounts can create or permanently delete users and assign
+  normal, special, or administrator roles.
+- Special users and administrators can create chains and value-chain links.
+- Normal users create and edit scopes, components, agents, and KPIs.
 - Deleting a user removes their sessions, relational account, complete RDF
   named graph and every relation in other graphs that references their nodes.
 - Every authenticated user can change their own password after confirming the
@@ -106,18 +132,26 @@ and sample contributions during its first start.
 
 | User | Password | Personal graph |
 |---|---|---|
-| `orca` | `orca123` | ORCA, exclusive value-chain manager |
+| `orca` | `orca123` | Administrator |
 | `andrea` | `demo123` | Andrea Cimmino |
 | `maria` | `demo123` | María Pérez |
 
-Version 6.0.0 applies these credentials once when upgrading an existing data
+Version 7.2.0 applies these credentials once when upgrading an existing data
 volume, so the three accounts can be used without deleting the current SQLite
 database. Password changes made afterwards are preserved on normal restarts.
 
 The example graph contains attributed contributions from all three users:
 ORCA provides a circular-fishing value chain and link, Andrea provides an
-energy scope, KPI and principal agent, and María provides a logistics agent
-and delivery KPI.
+energy component, KPI and principal agent, and María provides a logistics
+agent and delivery KPI.
+
+## Data and graph views
+
+The application opens in a table-based data workspace with separate sections
+for scopes, components, KPI, agents, value chains and relations. Search and
+authorship filters work over the same live GraphDB snapshot used by the graph
+view. Selecting a row can focus the corresponding node in the graph; no RDF is
+duplicated between the two interfaces.
 
 ### Daily GraphDB backups
 
@@ -157,22 +191,13 @@ sessions remain in the separate `orca-data` SQLite volume.
 Open two private browser windows with different users to test live
 collaboration and read-only attribution.
 
-### Preloaded value chain
+### Data ownership
 
-The global read-only graph contains `CadenaPescaAngola` and these
-`ValueChainLink` instances:
-
-- `SectorPrimario`
-- `Comercializadora`
-- `Intermediario`
-- `ConsumidorFinal`
-- `Transformacion`
-- `Hosteleria`
-
-Their directed flow is represented with `orca:precedes`. Editors can reference
-these nodes but cannot create or alter value-chain structure. Only the `orca`
-account can create additional chains and links or alter value-chain topology;
-preloaded global nodes remain read-only.
+Every application entity is stored in the named graph of a real user. Version
+7.6.0 removes the legacy global seed graph during startup, so no value chain,
+link, scope, component, agent, or KPI is displayed without an owner. Example
+entities are attributed to their corresponding bootstrap accounts and can be
+managed according to the normal ownership and role rules.
 
 ## GUI
 
@@ -184,8 +209,8 @@ The interface includes:
 - Original SKAI Research Group logo.
 - Current user and logout control.
 - Password-change dialog for every account.
-- ORCA-only user administration panel for creating and permanently deleting
-  accounts and their RDF graphs.
+- Administrator-only user panel for creating normal, special, or administrator
+  accounts and permanently deleting accounts and their RDF graphs.
 - New accounts and password changes require at least eight characters. The
   administration form displays this requirement next to the password field.
 - Node authorship and permission inspector.

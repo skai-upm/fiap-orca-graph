@@ -10,6 +10,7 @@ def test_orca_ontology_is_valid_and_contains_complete_model():
 
     for term in [
         orca.Scope,
+        orca.Component,
         orca.KPI,
         orca.Agent,
         orca.PrincipalAgent,
@@ -22,21 +23,23 @@ def test_orca_ontology_is_valid_and_contains_complete_model():
         orca.RegionalGovernmentSupportAgent,
         orca.ValueChain,
         orca.ValueChainLink,
-        orca.ApplicationLevel,
     ]:
         assert (term, RDF.type, OWL.Class) in graph
 
     for term in [
-        orca.hasSubscope,
-        orca.hasSuperscope,
+        orca.hasComponent,
+        orca.isComponentOf,
+        orca.hasSubcomponent,
+        orca.hasSupercomponent,
         orca.similarTo,
         orca.hasValueChainLink,
         orca.belongsTo,
         orca.participatesInValueChainLink,
         orca.appliesToValueChainLink,
         orca.appliesToAgent,
-        orca.appliesToScope,
+        orca.appliesToComponent,
         orca.hasKPI,
+        orca.hasAssociatedKPI,
         orca.precedes,
         orca.unitOfMeasure,
     ]:

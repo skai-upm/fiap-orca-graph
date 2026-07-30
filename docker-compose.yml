@@ -24,6 +24,7 @@ services:
       GRAPHDB_REPOSITORY: orca-graph
       GLOBAL_GRAPH_URI: https://orca-graph.example/graph/global
       PERSONAL_GRAPH_PREFIX: https://orca-graph.example/graph/users/
+      OM_GRAPH_URI: https://orca-graph.example/graph/ontology/om-2.0
       DATABASE_URL: sqlite+aiosqlite:////app/data/orca.db
     volumes:
       - orca-data:/app/data

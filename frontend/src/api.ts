@@ -1,5 +1,6 @@
 export type NodeType =
   | "Scope"
+  | "Component"
   | "KPI"
   | "ValueChain"
   | "ValueChainLink"
@@ -7,7 +8,6 @@ export type NodeType =
   | "AuxiliaryAgent"
   | "SupportAgent";
 
-export type ApplicationLevel = "General" | "Regional" | "Provincial" | "Locality";
 export type SupportAgentSubtype =
   | "SupportAgent"
   | "ResearchSupportAgent"
@@ -17,8 +17,10 @@ export type SupportAgentSubtype =
   | "RegionalGovernmentSupportAgent";
 
 export type RelationType =
-  | "hasSubscope"
-  | "hasSuperscope"
+  | "hasComponent"
+  | "isComponentOf"
+  | "hasSubcomponent"
+  | "hasSupercomponent"
   | "similarTo"
   | "hasValueChainLink"
   | "isValueChainLinkOf"
@@ -28,8 +30,9 @@ export type RelationType =
   | "hasParticipatingAgent"
   | "appliesToValueChainLink"
   | "appliesToAgent"
-  | "appliesToScope"
+  | "appliesToComponent"
   | "hasKPI"
+  | "hasAssociatedKPI"
   | "precedes";
 
 export interface User {
@@ -37,9 +40,11 @@ export interface User {
   username: string;
   display_name: string;
   initials: string;
-  role: string;
+  role: UserRole;
   graph_uri: string;
 }
+
+export type UserRole = "admin" | "special" | "normal";
 
 export interface UnitOption {
   iri: string;
@@ -53,8 +58,6 @@ export interface GraphNode {
   name: string;
   description: string;
   definition: string | null;
-  application_level: ApplicationLevel | null;
-  application_scope: string | null;
   unit_iri: string | null;
   unit_label: string | null;
   support_agent_subtype: SupportAgentSubtype | null;
@@ -86,8 +89,6 @@ export interface NodePayload {
   name: string;
   description: string;
   definition?: string;
-  application_level?: ApplicationLevel;
-  application_scope?: string;
   unit_iri?: string;
   support_agent_subtype?: SupportAgentSubtype;
   parent?: { parent_id: string; relation: RelationType };
@@ -116,7 +117,7 @@ export const api = {
   logout: () => request<void>("/api/auth/logout", { method: "POST" }),
   me: () => request<User>("/api/auth/me"),
   users: () => request<User[]>("/api/users"),
-  createUser: (body: { username: string; display_name: string; password: string }) =>
+  createUser: (body: { username: string; display_name: string; password: string; role: UserRole }) =>
     request<User>("/api/users", {
       method: "POST",
       body: JSON.stringify(body)
@@ -134,6 +135,11 @@ export const api = {
   graph: () => request<Snapshot>("/api/graph"),
   createNode: (body: NodePayload) =>
     request<GraphNode>("/api/nodes", { method: "POST", body: JSON.stringify(body) }),
+  updateNode: (nodeId: string, body: Omit<NodePayload, "type" | "parent">) =>
+    request<GraphNode>(`/api/nodes?node_id=${encodeURIComponent(nodeId)}`, {
+      method: "PUT",
+      body: JSON.stringify(body)
+    }),
   createRelation: (body: { source: string; target: string; type: RelationType }) =>
     request<GraphRelation>("/api/relations", {
       method: "POST",
