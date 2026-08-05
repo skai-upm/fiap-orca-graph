@@ -9,6 +9,7 @@ import {
   FileSpreadsheet,
   Pencil,
   Plus,
+  Search,
   ShieldCheck,
   Trash2,
   UserCog,
@@ -16,7 +17,8 @@ import {
   Users,
   X
 } from "lucide-react";
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import * as XLSX from "xlsx";
 
 import {
@@ -25,16 +27,56 @@ import {
   GraphRelation,
   NodePayload,
   NodeType,
+  OntologyConcept,
   RelationType,
   Snapshot,
   SupportAgentSubtype,
-  UnitOption,
   User,
   UserRole
 } from "./api";
 
 const emptySnapshot: Snapshot = { nodes: [], relations: [], current_user_id: "" };
-const APP_VERSION = "7.11.0";
+const APP_VERSION = "7.32.0";
+
+function snapshotForChain(snapshot: Snapshot, chainId: string | null): Snapshot {
+  if (!chainId) return { ...snapshot, nodes: [], relations: [] };
+  const chainIds = new Set(snapshot.nodes.filter((node) => node.type === "ValueChain").map((node) => node.id));
+  const explicitlyScoped = snapshot.nodes.filter((node) => node.chain_id === chainId).map((node) => node.id);
+  const membershipLinks = snapshot.relations.flatMap((edge) => {
+    if (edge.type === "hasValueChainLink" && edge.source === chainId) return [edge.target];
+    if (edge.type === "isValueChainLinkOf" && edge.target === chainId) return [edge.source];
+    return [];
+  });
+  const foreignLinks = new Set(snapshot.relations.flatMap((edge) => {
+    if (edge.type === "hasValueChainLink" && edge.source !== chainId && chainIds.has(edge.source)) return [edge.target];
+    if (edge.type === "isValueChainLinkOf" && edge.target !== chainId && chainIds.has(edge.target)) return [edge.source];
+    return [];
+  }));
+  const visible = new Set<string>([chainId, ...explicitlyScoped, ...membershipLinks]);
+  // Compatibility for data created before v7.26: include the connected model of
+  // the active chain, but never cross into another chain repository.
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const edge of snapshot.relations) {
+      const sourceVisible = visible.has(edge.source);
+      const targetVisible = visible.has(edge.target);
+      const candidate = sourceVisible ? edge.target : targetVisible ? edge.source : null;
+      if (candidate && !chainIds.has(candidate) && !foreignLinks.has(candidate) && !visible.has(candidate)) {
+        visible.add(candidate);
+        changed = true;
+      }
+    }
+  }
+  visible.delete(chainId); // The active chain is context, not a graph node.
+  const nodes = snapshot.nodes.filter((node) => visible.has(node.id) && node.type !== "ValueChain");
+  const nodeIds = new Set(nodes.map((node) => node.id));
+  return {
+    ...snapshot,
+    nodes,
+    relations: snapshot.relations.filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target))
+  };
+}
 
 const roleLabels: Record<UserRole, string> = {
   admin: "Administrador",
@@ -50,19 +92,24 @@ function canManageValueChains(user: User) {
   return user.role === "admin" || user.role === "special";
 }
 
+function hasSpecialPermissions(user: User) {
+  return user.role === "admin" || user.role === "special";
+}
+
 const supportAgentSubtypeLabels: Record<SupportAgentSubtype, string> = {
   SupportAgent: "Agente de apoyo (general)",
   ResearchSupportAgent: "Agente de apoyo a la investigación",
   TrainingSupportAgent: "Agente de apoyo formativo",
   GovernmentSupportAgent: "Agente de apoyo gubernamental",
   NationalGovernmentSupportAgent: "Agente gubernamental nacional",
-  RegionalGovernmentSupportAgent: "Agente gubernamental regional"
+  RegionalGovernmentSupportAgent: "Agente gubernamental regional",
+  LocalGovernmentSupportAgent: "Agente gubernamental local"
 };
 
 const typeInfo: Record<NodeType, { label: string; description: string }> = {
   Scope: { label: "Ámbito", description: "Área temática que agrupa componentes." },
   Component: { label: "Componente", description: "Elemento jerárquico que agrupa KPI." },
-  KPI: { label: "KPI", description: "Indicador aplicado a un eslabón o agente." },
+  KPI: { label: "KPI", description: "Indicador aplicado a un agente o componente." },
   ValueChain: { label: "Cadena de valor", description: "Agrupación de eslabones." },
   ValueChainLink: { label: "Eslabón", description: "Etapa de una cadena de valor." },
   PrincipalAgent: { label: "Agente principal", description: "Pertenece a un eslabón." },
@@ -82,13 +129,23 @@ const relationLabels: Record<RelationType, string> = {
   hasPrincipalAgent: "tiene agente principal",
   participatesInValueChainLink: "participa en",
   hasParticipatingAgent: "tiene agente participante",
-  appliesToValueChainLink: "se aplica al eslabón",
   appliesToAgent: "se aplica al agente",
   appliesToComponent: "se aplica al componente",
   hasKPI: "tiene KPI",
   hasAssociatedKPI: "tiene KPI asociado",
-  precedes: "precede a"
+  isRelated: "está relacionado con",
+  muevePescadoFresco: "Pescado fresco",
+  muevePescadoSeco: "Pescado seco",
+  mueveHarinaDePescado: "Harina de pescado",
+  financiación: "Financiación"
 };
+
+const linkRelationTypes: RelationType[] = [
+  "muevePescadoFresco",
+  "muevePescadoSeco",
+  "mueveHarinaDePescado",
+  "financiación"
+];
 
 const allowedMatrix: Partial<Record<NodeType, Partial<Record<NodeType, RelationType[]>>>> = {
   Scope: {
@@ -102,20 +159,19 @@ const allowedMatrix: Partial<Record<NodeType, Partial<Record<NodeType, RelationT
   KPI: {
     KPI: ["similarTo"],
     Component: ["appliesToComponent"],
-    ValueChainLink: ["appliesToValueChainLink"],
     PrincipalAgent: ["appliesToAgent"],
     AuxiliaryAgent: ["appliesToAgent"],
     SupportAgent: ["appliesToAgent"]
   },
   ValueChain: { ValueChainLink: ["hasValueChainLink"] },
   ValueChainLink: {
-    ValueChainLink: ["precedes"],
+    ValueChainLink: ["isRelated", "muevePescadoFresco", "muevePescadoSeco", "mueveHarinaDePescado", "financiación"],
     ValueChain: ["isValueChainLinkOf"],
     PrincipalAgent: ["hasPrincipalAgent"],
     AuxiliaryAgent: ["hasParticipatingAgent"],
     SupportAgent: ["hasParticipatingAgent"]
   },
-  PrincipalAgent: { ValueChainLink: ["belongsTo"], KPI: ["hasAssociatedKPI"] },
+  PrincipalAgent: { ValueChainLink: ["participatesInValueChainLink"], KPI: ["hasAssociatedKPI"] },
   AuxiliaryAgent: { ValueChainLink: ["participatesInValueChainLink"], KPI: ["hasAssociatedKPI"] },
   SupportAgent: { ValueChainLink: ["participatesInValueChainLink"], KPI: ["hasAssociatedKPI"] }
 };
@@ -140,50 +196,97 @@ function RdfMark() {
 }
 
 interface Filters {
-  scope: string;
-  user: string;
-  type: string;
-  node: string;
+  scope: string[];
+  user: string[];
+  type: NodeType[];
+  node: string[];
 }
 
-function scopeMembership(snapshot: Snapshot) {
-  const children = new Map<string, string[]>();
+const emptyFilters: Filters = { scope: [], user: [], type: [], node: [] };
+
+const agentTypes = new Set<NodeType>(["PrincipalAgent", "AuxiliaryAgent", "SupportAgent"]);
+
+function nodesForScopes(snapshot: Snapshot, scopeIds: string[]) {
+  if (!scopeIds.length) return null;
+
+  const nodesById = new Map(snapshot.nodes.map((node) => [node.id, node]));
+  const selectedScopes = new Set(scopeIds);
+  const components = new Set<string>();
+  const kpis = new Set<string>();
+  const agents = new Set<string>();
+  const links = new Set<string>();
+
+  const connectsTypes = (edge: GraphRelation, left: Set<string>, rightType: NodeType) => {
+    if (left.has(edge.source) && nodesById.get(edge.target)?.type === rightType) return edge.target;
+    if (left.has(edge.target) && nodesById.get(edge.source)?.type === rightType) return edge.source;
+    return null;
+  };
+
   snapshot.relations
-    .filter((edge) => edge.type === "hasSubcomponent")
-    .forEach((edge) => children.set(edge.source, [...(children.get(edge.source) ?? []), edge.target]));
-  const memberships = new Map<string, Set<string>>();
-  snapshot.nodes.filter((node) => node.type === "Scope").forEach((scope) => {
-    const queue = snapshot.relations
-      .filter((edge) => edge.type === "hasComponent" && edge.source === scope.id)
-      .map((edge) => edge.target);
-    const visited = new Set<string>();
-    while (queue.length) {
-      const id = queue.shift()!;
-      if (visited.has(id)) continue;
-      visited.add(id);
-      memberships.set(id, new Set([...(memberships.get(id) ?? []), scope.id]));
-      (children.get(id) ?? []).forEach((child) => queue.push(child));
-    }
-  });
-  return memberships;
+    .filter((edge) => edge.type === "hasComponent" || edge.type === "isComponentOf")
+    .forEach((edge) => {
+      const componentId = connectsTypes(edge, selectedScopes, "Component");
+      if (componentId) components.add(componentId);
+    });
+
+  // Components nested below a component of the scope belong to the same view.
+  let addedComponent = true;
+  while (addedComponent) {
+    addedComponent = false;
+    snapshot.relations
+      .filter((edge) => edge.type === "hasSubcomponent" || edge.type === "hasSupercomponent")
+      .forEach((edge) => {
+        const source = nodesById.get(edge.source);
+        const target = nodesById.get(edge.target);
+        if (source?.type !== "Component" || target?.type !== "Component") return;
+        const parentId = edge.type === "hasSubcomponent" ? edge.source : edge.target;
+        const childId = edge.type === "hasSubcomponent" ? edge.target : edge.source;
+        if (components.has(parentId) && !components.has(childId)) {
+          components.add(childId);
+          addedComponent = true;
+        }
+      });
+  }
+
+  snapshot.relations
+    .filter((edge) => edge.type === "hasKPI" || edge.type === "appliesToComponent")
+    .forEach((edge) => {
+      const kpiId = connectsTypes(edge, components, "KPI");
+      if (kpiId) kpis.add(kpiId);
+    });
+
+  snapshot.relations
+    .filter((edge) => edge.type === "appliesToAgent" || edge.type === "hasAssociatedKPI")
+    .forEach((edge) => {
+      if (kpis.has(edge.source) && agentTypes.has(nodesById.get(edge.target)?.type as NodeType)) agents.add(edge.target);
+      if (kpis.has(edge.target) && agentTypes.has(nodesById.get(edge.source)?.type as NodeType)) agents.add(edge.source);
+    });
+
+  snapshot.relations
+    .filter((edge) => ["belongsTo", "participatesInValueChainLink", "hasPrincipalAgent", "hasParticipatingAgent"].includes(edge.type))
+    .forEach((edge) => {
+      const linkId = connectsTypes(edge, agents, "ValueChainLink");
+      if (linkId) links.add(linkId);
+    });
+
+  return new Set([...selectedScopes, ...components, ...kpis, ...agents, ...links]);
 }
 
 function filterGraph(snapshot: Snapshot, filters: Filters): Snapshot {
-  const memberships = scopeMembership(snapshot);
+  const scopeView = nodesForScopes(snapshot, filters.scope);
   const focus = new Set<string>();
-  if (filters.node) {
-    focus.add(filters.node);
+  filters.node.forEach((nodeId) => {
+    focus.add(nodeId);
     snapshot.relations.forEach((edge) => {
-      if (edge.source === filters.node) focus.add(edge.target);
-      if (edge.target === filters.node) focus.add(edge.source);
+      if (edge.source === nodeId) focus.add(edge.target);
+      if (edge.target === nodeId) focus.add(edge.source);
     });
-  }
+  });
   const nodes = snapshot.nodes.filter((node) =>
-    (!filters.scope || memberships.get(node.id)?.has(filters.scope)) &&
-    (!filters.user || node.owner_id === filters.user ||
-      (filters.user === "global" && node.owner_id === null)) &&
-    (!filters.type || node.type === filters.type) &&
-    (!filters.node || focus.has(node.id))
+    (!scopeView || scopeView.has(node.id)) &&
+    (!filters.user.length || filters.user.includes(node.owner_id ?? "global")) &&
+    (!filters.type.length || filters.type.includes(node.type)) &&
+    (!filters.node.length || focus.has(node.id))
   );
   const ids = new Set(nodes.map((node) => node.id));
   return {
@@ -191,6 +294,70 @@ function filterGraph(snapshot: Snapshot, filters: Filters): Snapshot {
     nodes,
     relations: snapshot.relations.filter((edge) => ids.has(edge.source) && ids.has(edge.target))
   };
+}
+
+interface MultiFilterOption<T extends string> {
+  value: T;
+  label: string;
+  detail?: string;
+}
+
+function MultiFilterSelect<T extends string>({
+  label,
+  options,
+  selected,
+  onChange,
+  placeholder
+}: {
+  label: string;
+  options: MultiFilterOption<T>[];
+  selected: T[];
+  onChange: (values: T[]) => void;
+  placeholder: string;
+}) {
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+  const fieldRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const closeOnOutsideClick = (event: globalThis.MouseEvent) => {
+      if (fieldRef.current && !fieldRef.current.contains(event.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", closeOnOutsideClick);
+    return () => document.removeEventListener("mousedown", closeOnOutsideClick);
+  }, []);
+  const normalizedQuery = normalizedSearchText(query);
+  const selectedOptions = selected
+    .map((value) => options.find((option) => option.value === value))
+    .filter((option): option is MultiFilterOption<T> => Boolean(option));
+  const available = options.filter((option) =>
+    !selected.includes(option.value) &&
+    (!normalizedQuery || normalizedSearchText(`${option.label} ${option.detail ?? ""}`).includes(normalizedQuery))
+  );
+  return <div className="graph-multi-filter" ref={fieldRef}>
+    <label>{label}</label>
+    {selectedOptions.length > 0 && <div className="graph-filter-chips">
+      {selectedOptions.map((option) => <span className="graph-filter-chip" key={option.value}>
+        {option.label}
+        <button type="button" aria-label={`Eliminar ${option.label}`} onClick={() => onChange(selected.filter((value) => value !== option.value))}><X /></button>
+      </span>)}
+    </div>}
+    <div className="graph-filter-combobox">
+      <input
+        value={query}
+        placeholder={placeholder}
+        onFocus={() => setOpen(true)}
+        onChange={(event) => { setQuery(event.target.value); setOpen(true); }}
+      />
+      <button type="button" className="graph-filter-toggle" aria-label={`Mostrar opciones de ${label}`} onClick={() => setOpen((current) => !current)}>⌄</button>
+      {open && <div className="graph-filter-options">
+        {available.length ? available.map((option) => <button type="button" key={option.value} onClick={() => {
+          onChange([...selected, option.value]);
+          setQuery("");
+          setOpen(false);
+        }}><strong>{option.label}</strong>{option.detail && <span>{option.detail}</span>}</button>) : <p>No hay más coincidencias</p>}
+      </div>}
+    </div>
+  </div>;
 }
 
 function Login({ onLogin }: { onLogin: (user: User) => void }) {
@@ -216,11 +383,7 @@ function Login({ onLogin }: { onLogin: (user: User) => void }) {
     <main className="login-page">
       <section className="login-card">
         <div className="login-brand">
-          <RdfMark />
-          <div>
-            <h1><em>ORCA</em> Graph</h1>
-            <p>Ontology-Restricted Collaborative Authoring of Graphs</p>
-          </div>
+          <img src="/assets/orca-graph-logo.webp" alt="ORCA Graph" />
         </div>
         <form onSubmit={submit}>
           <label htmlFor="username">Usuario</label>
@@ -249,13 +412,25 @@ function GraphCanvas({
 }) {
   const container = useRef<HTMLDivElement>(null);
   const instance = useRef<Core | null>(null);
+  const positionMemory = useRef<Map<string, { x: number; y: number }>>(new Map());
+  const viewportMemory = useRef<{ zoom: number; pan: { x: number; y: number } } | null>(null);
 
   useEffect(() => {
     if (!container.current) return;
+    const previousPositions = new Map(positionMemory.current);
     instance.current?.destroy();
+    const agentKpiRelationTypes = new Set<RelationType>(["hasAssociatedKPI", "appliesToAgent"]);
+    const renderedAgentKpiPairs = new Set<string>();
+    const visualRelations = snapshot.relations.filter((edge) => {
+      if (!agentKpiRelationTypes.has(edge.type)) return true;
+      const pairKey = [edge.source, edge.target].sort().join("|");
+      if (renderedAgentKpiPairs.has(pairKey)) return false;
+      renderedAgentKpiPairs.add(pairKey);
+      return true;
+    });
     const neighbours = new Map<string, Set<string>>();
     snapshot.nodes.forEach((node) => neighbours.set(node.id, new Set()));
-    snapshot.relations.forEach((edge) => {
+    visualRelations.forEach((edge) => {
       neighbours.get(edge.source)?.add(edge.target);
       neighbours.get(edge.target)?.add(edge.source);
     });
@@ -273,6 +448,38 @@ function GraphCanvas({
       AuxiliaryAgent: [120, 116],
       SupportAgent: [120, 116]
     };
+    const layerByType: Record<NodeType, number> = {
+      ValueChain: 0,
+      ValueChainLink: 1,
+      PrincipalAgent: 2,
+      AuxiliaryAgent: 2,
+      SupportAgent: 2,
+      KPI: 3,
+      Component: 4,
+      Scope: 5
+    };
+    const layerCounts = new Map<number, number>();
+    snapshot.nodes.forEach((node) => {
+      const layer = layerByType[node.type];
+      layerCounts.set(layer, (layerCounts.get(layer) ?? 0) + 1);
+    });
+    const layerIndexes = new Map<number, number>();
+    const positions = new Map<string, { x: number; y: number }>();
+    snapshot.nodes.forEach((node) => {
+      const previous = previousPositions.get(node.id);
+      if (previous) {
+        positions.set(node.id, previous);
+        return;
+      }
+      const layer = layerByType[node.type];
+      const index = layerIndexes.get(layer) ?? 0;
+      const count = layerCounts.get(layer) ?? 1;
+      positions.set(node.id, {
+        x: 180 + (index - (count - 1) / 2) * 240,
+        y: 150 + layer * 270
+      });
+      layerIndexes.set(layer, index + 1);
+    });
     instance.current = cytoscape({
       container: container.current,
       elements: [
@@ -294,16 +501,23 @@ function GraphCanvas({
             };
           })()
         })),
-        ...snapshot.relations.map((edge, index) => ({
-          data: {
-            id: `${edge.source}-${edge.type}-${edge.target}-${index}`,
-            source: edge.source,
-            target: edge.target,
-            label: relationLabels[edge.type],
-            editable: edge.editable,
-            semantic: ["similarTo", "appliesToAgent", "appliesToValueChainLink", "appliesToComponent", "hasKPI", "hasAssociatedKPI"].includes(edge.type)
-          }
-        }))
+        ...visualRelations.map((edge, index) => {
+          const sourceType = snapshot.nodes.find((node) => node.id === edge.source)?.type;
+          const targetType = snapshot.nodes.find((node) => node.id === edge.target)?.type;
+          const structural =
+            (sourceType === "ValueChainLink" && targetType === "ValueChainLink") ||
+            (sourceType === "Component" && targetType === "Component");
+          return {
+            data: {
+              id: `${edge.source}-${edge.type}-${edge.target}-${index}`,
+              source: edge.source,
+              target: edge.target,
+              label: structural ? relationLabels[edge.type] : "",
+              editable: edge.editable,
+              structural
+            }
+          };
+        })
       ],
       style: [
         {
@@ -348,9 +562,10 @@ function GraphCanvas({
             width: 2,
             "line-color": "#467599",
             "target-arrow-color": "#467599",
-            "target-arrow-shape": "triangle",
+            "target-arrow-shape": "none",
             "curve-style": "bezier",
-            label: "data(label)",
+            label: "",
+            "line-style": "dashed",
             color: "#657789",
             "font-size": 12,
             "font-weight": 600,
@@ -359,24 +574,41 @@ function GraphCanvas({
             "text-background-padding": "3px"
           }
         },
-        { selector: "edge[?semantic]", style: { "line-color": "#33a37a", "target-arrow-color": "#33a37a", "line-style": "dashed" } },
+        { selector: "edge[?structural]", style: { label: "data(label)", "line-style": "solid", "target-arrow-shape": "triangle" } },
         { selector: "edge[!editable]", style: { opacity: 0.92, "text-opacity": 0.96, "line-color": "#a8c5d7", "target-arrow-color": "#a8c5d7" } },
         { selector: ":selected", style: { "border-color": "#9ed8db", "border-width": 6, opacity: 1, "text-opacity": 1 } },
         { selector: "node[!editable]:selected", style: { opacity: 0.98, "text-opacity": 1 } }
       ],
       layout: {
-        name: snapshot.nodes.length > 28 ? "cose" : "breadthfirst",
-        directed: true,
-        padding: 60,
-        spacingFactor: snapshot.nodes.length > 25 ? 1.05 : 1.25,
-        animate: false
+        name: "preset",
+        positions: Object.fromEntries(positions),
+        padding: 80,
+        fit: previousPositions.size === 0
       }
     });
+    if (viewportMemory.current && previousPositions.size > 0) {
+      instance.current.zoom(viewportMemory.current.zoom);
+      instance.current.pan(viewportMemory.current.pan);
+    }
     instance.current.on("tap", "node", (event) => onSelect(event.target.id()));
+    instance.current.on("dragfree", "node", (event) => {
+      positionMemory.current.set(event.target.id(), { ...event.target.position() });
+    });
     instance.current.on("tap", (event) => {
       if (event.target === instance.current) onSelect(null);
     });
-    return () => instance.current?.destroy();
+    return () => {
+      if (instance.current) {
+        viewportMemory.current = {
+          zoom: instance.current.zoom(),
+          pan: { ...instance.current.pan() }
+        };
+      }
+      instance.current?.nodes().forEach((node) => {
+        positionMemory.current.set(node.id(), { ...node.position() });
+      });
+      instance.current?.destroy();
+    };
   }, [snapshot, onSelect]);
 
   useEffect(() => {
@@ -408,7 +640,7 @@ function creationTargets(type: NodeType, nodes: GraphNode[]) {
   }
   if (type === "PrincipalAgent") {
     return nodes.filter((node) => node.type === "ValueChainLink")
-      .map((node) => ({ node, relation: "belongsTo" as RelationType }));
+      .map((node) => ({ node, relation: "participatesInValueChainLink" as RelationType }));
   }
   if (type === "AuxiliaryAgent" || type === "SupportAgent") {
     return nodes.filter((node) => node.type === "ValueChainLink")
@@ -416,14 +648,12 @@ function creationTargets(type: NodeType, nodes: GraphNode[]) {
   }
   if (type === "KPI") {
     return nodes
-      .filter((node) => ["Component", "ValueChainLink", "PrincipalAgent", "AuxiliaryAgent", "SupportAgent"].includes(node.type))
+      .filter((node) => ["Component", "PrincipalAgent", "AuxiliaryAgent", "SupportAgent"].includes(node.type))
       .map((node) => ({
         node,
         relation: node.type === "Component"
           ? "appliesToComponent" as RelationType
-          : node.type === "ValueChainLink"
-            ? "appliesToValueChainLink" as RelationType
-            : "appliesToAgent" as RelationType
+          : "appliesToAgent" as RelationType
       }));
   }
   return [];
@@ -444,6 +674,14 @@ function MultiNodeSelect({
 }) {
   const [query, setQuery] = useState("");
   const [open, setOpen] = useState(false);
+  const fieldRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const closeOnOutsideClick = (event: globalThis.MouseEvent) => {
+      if (fieldRef.current && !fieldRef.current.contains(event.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", closeOnOutsideClick);
+    return () => document.removeEventListener("mousedown", closeOnOutsideClick);
+  }, []);
   const selectedNodes = selected
     .map((id) => options.find((node) => node.id === id))
     .filter((node): node is GraphNode => Boolean(node));
@@ -452,7 +690,7 @@ function MultiNodeSelect({
     `${node.name} ${typeInfo[node.type].label}`.toLowerCase().includes(query.toLowerCase())
   );
   return (
-    <div className="multi-field">
+    <div className="multi-field" ref={fieldRef}>
       <label>{label}</label>
       <div className="multi-tags">
         {selectedNodes.map((node) => (
@@ -488,68 +726,14 @@ function MultiNodeSelect({
   );
 }
 
-function UnitSelect({
-  units,
-  value,
-  onChange
-}: {
-  units: UnitOption[];
-  value: string;
-  onChange: (iri: string) => void;
-}) {
-  const [query, setQuery] = useState("");
-  const [open, setOpen] = useState(false);
-  const selected = units.find((unit) => unit.iri === value);
-  const normalizedQuery = query.trim().toLowerCase();
-  const available = units.filter((unit) =>
-    `${unit.label} ${unit.symbol} ${unit.iri}`.toLowerCase().includes(normalizedQuery)
-  );
-  return (
-    <div className="multi-field">
-      <label>Unidad OM</label>
-      {selected && (
-        <div className="multi-tags">
-          <span className="multi-tag">
-            {selected.label}{selected.symbol ? ` (${selected.symbol})` : ""}
-            <button type="button" aria-label="Quitar unidad" onClick={() => onChange("")}>×</button>
-          </span>
-        </div>
-      )}
-      <div className="multi-combobox">
-        <input
-          value={query}
-          placeholder="Buscar por nombre, símbolo o IRI..."
-          onFocus={() => setOpen(true)}
-          onChange={(event) => { setQuery(event.target.value); setOpen(true); }}
-        />
-        <button type="button" className="multi-toggle" aria-label="Mostrar unidades" onClick={() => setOpen(!open)}>⌄</button>
-        {open && (
-          <div className="multi-options unit-options">
-            {available.length ? available.map((unit) => (
-              <button
-                type="button"
-                key={unit.iri}
-                onClick={() => { onChange(unit.iri); setQuery(""); setOpen(false); }}
-              >
-                <strong>{unit.label}{unit.symbol ? ` (${unit.symbol})` : ""}</strong>
-                <span>{unit.iri}</span>
-              </button>
-            )) : <p>No se han encontrado unidades</p>}
-          </div>
-        )}
-      </div>
-      {!value && <span className="field-hint">Selecciona una unidad de la ontología OM 2.0.</span>}
-    </div>
-  );
-}
-
 function NodeDialog({
   initialType,
   initialNode,
   nodes,
   relations,
-  units,
   canManageValueChain,
+  canManageRestrictedAgents,
+  activeChainId,
   onClose,
   onCreated
 }: {
@@ -557,8 +741,9 @@ function NodeDialog({
   initialNode?: GraphNode | null;
   nodes: GraphNode[];
   relations: GraphRelation[];
-  units: UnitOption[];
   canManageValueChain: boolean;
+  canManageRestrictedAgents: boolean;
+  activeChainId: string | null;
   onClose: () => void;
   onCreated: () => Promise<void>;
 }) {
@@ -567,8 +752,8 @@ function NodeDialog({
   const editing = Boolean(initialNode);
   const [name, setName] = useState(initialNode?.name ?? "");
   const [description, setDescription] = useState(initialNode?.description ?? "");
-  const [definition, setDefinition] = useState(initialNode?.definition ?? "");
-  const [unitIri, setUnitIri] = useState(initialNode?.unit_iri ?? "");
+  const [identification, setIdentification] = useState(initialNode?.identification ?? "");
+  const [evaluation, setEvaluation] = useState(initialNode?.evaluation ?? "");
   const [supportAgentSubtype, setSupportAgentSubtype] =
     useState<SupportAgentSubtype>(initialNode?.support_agent_subtype ?? "SupportAgent");
   const canonicalScopeComponent = (edge: Pick<GraphRelation, "source" | "target" | "type">) =>
@@ -604,8 +789,6 @@ function NodeDialog({
     }
     return null;
   };
-  const canonicalKpiLink = (edge: Pick<GraphRelation, "source" | "target" | "type">) =>
-    edge.type === "appliesToValueChainLink" ? { kpiId: edge.source, linkId: edge.target } : null;
   const unique = (ids: string[]) => [...new Set(ids)];
   const [scopeComponentIds, setScopeComponentIds] = useState<string[]>(
     initialNode?.type === "Scope"
@@ -644,20 +827,12 @@ function NodeDialog({
     ? relations.map(membership).find((item) => item?.linkId === initialNode.id)?.chainId ?? ""
     : "";
   const [chainLinkIds, setChainLinkIds] = useState<string[]>(initialChainLinkIds);
-  const [chainId, setChainId] = useState(initialLinkChainId);
-  const [previousLinkIds, setPreviousLinkIds] = useState<string[]>(
+  const [chainId, setChainId] = useState(initialLinkChainId || activeChainId || "");
+  const [linkRelations, setLinkRelations] = useState<{ targetId: string; type: RelationType }[]>(
     initialNode?.type === "ValueChainLink"
-      ? relations.filter((edge) => edge.type === "precedes" && edge.target === initialNode.id).map((edge) => edge.source)
-      : []
-  );
-  const [nextLinkIds, setNextLinkIds] = useState<string[]>(
-    initialNode?.type === "ValueChainLink"
-      ? relations.filter((edge) => edge.type === "precedes" && edge.source === initialNode.id).map((edge) => edge.target)
-      : []
-  );
-  const [linkKpiIds, setLinkKpiIds] = useState<string[]>(
-    initialNode?.type === "ValueChainLink"
-      ? unique(relations.map(canonicalKpiLink).filter((item) => item?.linkId === initialNode.id).map((item) => item!.kpiId))
+      ? relations
+          .filter((edge) => linkRelationTypes.includes(edge.type) && (edge.source === initialNode.id || edge.target === initialNode.id))
+          .map((edge) => ({ targetId: edge.source === initialNode.id ? edge.target : edge.source, type: edge.type }))
       : []
   );
   const [relatedLinkIds, setRelatedLinkIds] = useState<string[]>(
@@ -680,11 +855,6 @@ function NodeDialog({
       ? unique(relations.map(canonicalAgentKpi).filter((item) => item?.kpiId === initialNode.id).map((item) => item!.agentId))
       : []
   );
-  const [kpiLinkIds, setKpiLinkIds] = useState<string[]>(
-    initialNode?.type === "KPI"
-      ? unique(relations.map(canonicalKpiLink).filter((item) => item?.kpiId === initialNode.id).map((item) => item!.linkId))
-      : []
-  );
   const [error, setError] = useState("");
   const isAgent = ["PrincipalAgent", "AuxiliaryAgent", "SupportAgent"].includes(type);
   const links = nodes.filter((node) => node.type === "ValueChainLink" && node.id !== initialNode?.id);
@@ -697,7 +867,7 @@ function NodeDialog({
     const assignedChain = chainForLink.get(link.id);
     return !assignedChain || assignedChain === initialNode?.id;
   });
-  const orderableLinks = links.filter((link) => chainForLink.get(link.id) === chainId);
+  const relatedLinkOptions = links.filter((link) => !chainId || chainForLink.get(link.id) === chainId);
   const scopes = nodes.filter((node) => node.type === "Scope");
   const components = nodes.filter((node) => node.type === "Component" && node.id !== initialNode?.id);
   const kpis = nodes.filter((node) => node.type === "KPI");
@@ -709,9 +879,10 @@ function NodeDialog({
     event.preventDefault();
     setError("");
     const payload: NodePayload = { type, name, description };
+    if (type !== "ValueChain" && activeChainId) payload.chain_id = activeChainId;
     if (type === "KPI") {
-      payload.definition = definition;
-      payload.unit_iri = unitIri;
+      payload.identification = identification;
+      payload.evaluation = evaluation;
     }
     if (type === "SupportAgent") {
       payload.support_agent_subtype = supportAgentSubtype;
@@ -719,7 +890,7 @@ function NodeDialog({
     if (!editing && isAgent && relatedLinkIds.length) {
       payload.parent = {
         parent_id: relatedLinkIds[0],
-        relation: type === "PrincipalAgent" ? "belongsTo" : "participatesInValueChainLink"
+        relation: "participatesInValueChainLink"
       };
     }
     if (!editing && type === "ValueChainLink" && chainId) {
@@ -736,7 +907,7 @@ function NodeDialog({
     }
     try {
       if (initialNode) {
-        const { type: _type, parent: _parent, ...changes } = payload;
+        const { type: _type, parent: _parent, chain_id: _chainId, ...changes } = payload;
         await api.updateNode(initialNode.id, changes);
         const desired: { source: string; target: string; type: RelationType }[] = [];
         if (type === "ValueChain") {
@@ -744,9 +915,7 @@ function NodeDialog({
         }
         if (type === "ValueChainLink") {
           desired.push({ source: chainId, target: initialNode.id, type: "hasValueChainLink" });
-          previousLinkIds.forEach((id) => desired.push({ source: id, target: initialNode.id, type: "precedes" }));
-          nextLinkIds.forEach((id) => desired.push({ source: initialNode.id, target: id, type: "precedes" }));
-          linkKpiIds.forEach((id) => desired.push({ source: id, target: initialNode.id, type: "appliesToValueChainLink" }));
+          linkRelations.filter((item) => item.targetId).forEach((item) => desired.push({ source: initialNode.id, target: item.targetId, type: item.type }));
         }
         if (type === "Scope") {
           scopeComponentIds.forEach((id) => desired.push({ source: initialNode.id, target: id, type: "hasComponent" }));
@@ -761,14 +930,13 @@ function NodeDialog({
           relatedLinkIds.forEach((id) => desired.push({
             source: initialNode.id,
             target: id,
-            type: type === "PrincipalAgent" ? "belongsTo" : "participatesInValueChainLink"
+            type: "participatesInValueChainLink"
           }));
           agentKpiIds.forEach((id) => desired.push({ source: initialNode.id, target: id, type: "hasAssociatedKPI" }));
         }
         if (type === "KPI") {
           kpiComponentIds.forEach((id) => desired.push({ source: initialNode.id, target: id, type: "appliesToComponent" }));
           kpiAgentIds.forEach((id) => desired.push({ source: initialNode.id, target: id, type: "appliesToAgent" }));
-          kpiLinkIds.forEach((id) => desired.push({ source: initialNode.id, target: id, type: "appliesToValueChainLink" }));
         }
         if (["ValueChain", "ValueChainLink", "Scope", "Component", "KPI"].includes(type) || isAgent) {
           const relevant = (edge: GraphRelation) => {
@@ -779,8 +947,7 @@ function NodeDialog({
             return (
               (type === "ValueChain" && item?.chainId === initialNode.id) ||
               (type === "ValueChainLink" && (item?.linkId === initialNode.id ||
-                canonicalKpiLink(edge)?.linkId === initialNode.id ||
-                (edge.type === "precedes" && (edge.source === initialNode.id || edge.target === initialNode.id)))) ||
+                (linkRelationTypes.includes(edge.type) && (edge.source === initialNode.id || edge.target === initialNode.id)))) ||
               (type === "Scope" && scopeComponent?.scopeId === initialNode.id) ||
               (type === "Component" && (
                 scopeComponent?.componentId === initialNode.id ||
@@ -794,8 +961,7 @@ function NodeDialog({
               )) ||
               (type === "KPI" && (
                 canonicalComponentKpi(edge)?.kpiId === initialNode.id ||
-                canonicalAgentKpi(edge)?.kpiId === initialNode.id ||
-                canonicalKpiLink(edge)?.kpiId === initialNode.id
+                canonicalAgentKpi(edge)?.kpiId === initialNode.id
               ))
             );
           };
@@ -808,14 +974,16 @@ function NodeDialog({
             const componentKpi = canonicalComponentKpi(edge);
             const agentLink = canonicalAgentLink(edge);
             const agentKpi = canonicalAgentKpi(edge);
-            const kpiLink = canonicalKpiLink(edge);
             if (item) return `${item.chainId}|${item.linkId}|membership`;
             if (scopeComponent) return `${scopeComponent.scopeId}|${scopeComponent.componentId}|scope-component`;
             if (hierarchy) return `${hierarchy.superId}|${hierarchy.subId}|component-hierarchy`;
             if (componentKpi) return `${componentKpi.componentId}|${componentKpi.kpiId}|component-kpi`;
             if (agentLink) return `${agentLink.agentId}|${agentLink.linkId}|agent-link`;
             if (agentKpi) return `${agentKpi.agentId}|${agentKpi.kpiId}|agent-kpi`;
-            if (kpiLink) return `${kpiLink.kpiId}|${kpiLink.linkId}|kpi-link`;
+            if (linkRelationTypes.includes(edge.type)) {
+              const [left, right] = [edge.source, edge.target].sort();
+              return `${left}|${right}|${edge.type}`;
+            }
             return `${edge.source}|${edge.target}|${edge.type}`;
           };
           const desiredKeys = new Set(desired.map(normalized));
@@ -842,9 +1010,7 @@ function NodeDialog({
           .forEach((id) => relations.push({ source: id, target: created.id, type: "hasSubcomponent" }));
         subcomponentIds.forEach((id) => relations.push({ source: created.id, target: id, type: "hasSubcomponent" }));
         componentKpiIds.forEach((id) => relations.push({ source: created.id, target: id, type: "hasKPI" }));
-        previousLinkIds.forEach((id) => relations.push({ source: id, target: created.id, type: "precedes" }));
-        nextLinkIds.forEach((id) => relations.push({ source: created.id, target: id, type: "precedes" }));
-        linkKpiIds.forEach((id) => relations.push({ source: id, target: created.id, type: "appliesToValueChainLink" }));
+        linkRelations.filter((item) => item.targetId).forEach((item) => relations.push({ source: created.id, target: item.targetId, type: item.type }));
         relatedLinkIds.slice(payload.parent ? 1 : 0).forEach((id) => relations.push({
           source: created.id,
           target: id,
@@ -854,7 +1020,6 @@ function NodeDialog({
         if (type === "KPI") {
           kpiComponentIds.forEach((id) => relations.push({ source: created.id, target: id, type: "appliesToComponent" }));
           kpiAgentIds.forEach((id) => relations.push({ source: created.id, target: id, type: "appliesToAgent" }));
-          kpiLinkIds.forEach((id) => relations.push({ source: created.id, target: id, type: "appliesToValueChainLink" }));
         }
         await Promise.all(relations.map((relation) => api.createRelation(relation)));
       }
@@ -866,7 +1031,7 @@ function NodeDialog({
   }
 
   return (
-    <div className="overlay">
+    <div className="overlay" onMouseDown={(event: MouseEvent<HTMLDivElement>) => { if (event.target === event.currentTarget) onClose(); }}>
       <form className="dialog" onSubmit={submit}>
         <div className="dialog-title">
           <div>
@@ -884,9 +1049,12 @@ function NodeDialog({
           </>
         ) : type === "KPI" ? (
           <>
-            <label htmlFor="new-definition">Definición</label>
-            <textarea id="new-definition" required value={definition} onChange={(e) => setDefinition(e.target.value)} />
-            <UnitSelect units={units} value={unitIri} onChange={setUnitIri} />
+            <label htmlFor="new-identification">Identificación</label>
+            <textarea id="new-identification" required maxLength={2000} value={identification} onChange={(e) => setIdentification(e.target.value)} />
+            <label htmlFor="new-description">Descripción</label>
+            <textarea id="new-description" required maxLength={2000} value={description} onChange={(e) => setDescription(e.target.value)} />
+            <label htmlFor="new-evaluation">Evaluación</label>
+            <textarea id="new-evaluation" required maxLength={2000} value={evaluation} onChange={(e) => setEvaluation(e.target.value)} />
           </>
         ) : (
           <>
@@ -896,7 +1064,7 @@ function NodeDialog({
               <label>Tipo de agente
                 <select value={type} onChange={(e) => setType(e.target.value as NodeType)}>
                   <option value="PrincipalAgent">Principal</option>
-                  <option value="AuxiliaryAgent">Auxiliar</option>
+                  {canManageRestrictedAgents && <option value="AuxiliaryAgent">Auxiliar</option>}
                   <option value="SupportAgent">Apoyo</option>
                 </select>
               </label>
@@ -907,7 +1075,10 @@ function NodeDialog({
                   value={supportAgentSubtype}
                   onChange={(e) => setSupportAgentSubtype(e.target.value as SupportAgentSubtype)}
                 >
-                  {(Object.keys(supportAgentSubtypeLabels) as SupportAgentSubtype[]).map((subtype) => (
+                  {(Object.keys(supportAgentSubtypeLabels) as SupportAgentSubtype[])
+                    .filter((subtype) => subtype !== "GovernmentSupportAgent")
+                    .filter((subtype) => subtype !== "LocalGovernmentSupportAgent" || canManageRestrictedAgents)
+                    .map((subtype) => (
                     <option value={subtype} key={subtype}>{supportAgentSubtypeLabels[subtype]}</option>
                   ))}
                 </select>
@@ -928,19 +1099,23 @@ function NodeDialog({
           <MultiNodeSelect label="Eslabones de la cadena" options={selectableChainLinks} selected={chainLinkIds} onChange={setChainLinkIds} placeholder="Buscar y añadir varios eslabones..." />
         )}
         {type === "ValueChainLink" && <>
-          <label>Cadena de valor
-            <select required value={chainId} onChange={(e) => {
-              setChainId(e.target.value);
-              setPreviousLinkIds([]);
-              setNextLinkIds([]);
-            }}>
-              <option value="">Selecciona la cadena a la que pertenece</option>
-              {chains.map((chain) => <option value={chain.id} key={chain.id}>{chain.name}</option>)}
-            </select>
-          </label>
-          <MultiNodeSelect label="Eslabones anteriores" options={orderableLinks} selected={previousLinkIds} onChange={setPreviousLinkIds} placeholder="Buscar y añadir eslabones anteriores..." />
-          <MultiNodeSelect label="Eslabones siguientes" options={orderableLinks} selected={nextLinkIds} onChange={setNextLinkIds} placeholder="Buscar y añadir eslabones siguientes..." />
-          <MultiNodeSelect label="KPI asociados" options={kpis} selected={linkKpiIds} onChange={setLinkKpiIds} placeholder="Buscar y añadir KPI..." />
+          <div className="active-chain-form-note"><strong>Cadena activa</strong><span>{chains.find((chain) => chain.id === chainId)?.name ?? "Sin cadena activa"}</span></div>
+          <label>Relaciones con otros eslabones</label>
+          <div className="relation-list">
+            {linkRelations.map((item, index) => (
+              <div className="relation-item" key={`${index}-${item.targetId}`}>
+                <select value={item.targetId} onChange={(e) => setLinkRelations((current) => current.map((row, rowIndex) => rowIndex === index ? { ...row, targetId: e.target.value } : row))}>
+                  <option value="">Selecciona otro eslabón</option>
+                  {relatedLinkOptions.map((link) => <option value={link.id} key={link.id}>{link.name}</option>)}
+                </select>
+                <select value={item.type} onChange={(e) => setLinkRelations((current) => current.map((row, rowIndex) => rowIndex === index ? { ...row, type: e.target.value as RelationType } : row))}>
+                  {linkRelationTypes.map((relationType) => <option value={relationType} key={relationType}>{relationLabels[relationType]}</option>)}
+                </select>
+                <button type="button" className="icon" aria-label="Eliminar relación" onClick={() => setLinkRelations((current) => current.filter((_, rowIndex) => rowIndex !== index))}><Trash2 /></button>
+              </div>
+            ))}
+            <button type="button" className="secondary" onClick={() => setLinkRelations((current) => [...current, { targetId: "", type: "muevePescadoFresco" }])}>Añadir relación</button>
+          </div>
         </>}
         {isAgent && (
           <MultiNodeSelect label="Eslabones relacionados" options={links} selected={relatedLinkIds} onChange={setRelatedLinkIds} placeholder="Buscar y añadir eslabones..." />
@@ -951,7 +1126,6 @@ function NodeDialog({
         {type === "KPI" && <>
           <MultiNodeSelect label="Componentes" options={components} selected={kpiComponentIds} onChange={setKpiComponentIds} placeholder="Buscar y añadir componentes..." />
           <MultiNodeSelect label="Agentes" options={agents} selected={kpiAgentIds} onChange={setKpiAgentIds} placeholder="Buscar y añadir agentes..." />
-          <MultiNodeSelect label="Eslabones" options={links} selected={kpiLinkIds} onChange={setKpiLinkIds} placeholder="Buscar y añadir eslabones..." />
         </>}
         {error && <div className="error">{error}</div>}
         <div className="dialog-actions">
@@ -991,7 +1165,7 @@ function RelationDialog({
   let allowed = allowedRelations(source, target);
   if (!canManageValueChain) {
     allowed = allowed.filter((item) =>
-      !["hasValueChainLink", "isValueChainLinkOf", "precedes"].includes(item)
+      !["hasValueChainLink", "isValueChainLinkOf", "isRelated", ...linkRelationTypes].includes(item)
     );
   }
 
@@ -1012,7 +1186,7 @@ function RelationDialog({
   }
 
   return (
-    <div className="overlay">
+    <div className="overlay" onMouseDown={(event: MouseEvent<HTMLDivElement>) => { if (event.target === event.currentTarget) onClose(); }}>
       <form className="dialog compact" onSubmit={submit}>
         <div className="dialog-title">
           <div><strong>Nueva relación</strong><span>Se guardará en tu grafo personal.</span></div>
@@ -1083,7 +1257,7 @@ function PasswordDialog({
   }
 
   return (
-    <div className="overlay">
+    <div className="overlay" onMouseDown={(event: MouseEvent<HTMLDivElement>) => { if (event.target === event.currentTarget) onClose(); }}>
       <form className="dialog compact" onSubmit={submit}>
         <div className="dialog-title">
           <div><strong>Cambiar contraseña</strong><span>Se cerrarán todas las sesiones activas.</span></div>
@@ -1163,7 +1337,7 @@ function UserAdminDialog({
   }
 
   return (
-    <div className="overlay">
+    <div className="overlay" onMouseDown={(event: MouseEvent<HTMLDivElement>) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="dialog user-admin-dialog">
         <div className="dialog-title">
           <div><strong>Administrar usuarios</strong><span>Al borrar una cuenta también se elimina todo su grafo.</span></div>
@@ -1223,58 +1397,139 @@ function UserAdminDialog({
   );
 }
 
-type DataSection = "ValueChain" | "ValueChainLink" | "Scope" | "Component" | "Agent" | "KPI";
+type DataSection = "Definitions" | "ValueChain" | "ValueChainLink" | "Scope" | "Component" | "Agent" | "KPI";
 
 const dataSections: { id: DataSection; label: string }[] = [
+  { id: "Definitions", label: "Definiciones" },
   { id: "ValueChain", label: "Cadena de valor" },
   { id: "ValueChainLink", label: "Eslabón" },
+  { id: "Agent", label: "Agente" },
   { id: "Scope", label: "Ámbito" },
   { id: "Component", label: "Componente" },
-  { id: "Agent", label: "Agente" },
   { id: "KPI", label: "KPI" }
 ];
 
 function DataWorkspace({
   snapshot,
+  globalSnapshot,
+  activeChainId,
   user,
   onSelect,
+  onActivateChain,
   onCreateNode,
   onEditNode,
   onDeleteNode
 }: {
   snapshot: Snapshot;
+  globalSnapshot: Snapshot;
+  activeChainId: string | null;
   user: User;
   onSelect: (id: string) => void;
+  onActivateChain: (id: string) => void;
   onCreateNode: (type: NodeType) => void;
   onEditNode: (node: GraphNode) => void;
   onDeleteNode: (node: GraphNode) => void;
 }) {
-  const [section, setSection] = useState<DataSection>("Scope");
+  const [section, setSection] = useState<DataSection>("Definitions");
   const [query, setQuery] = useState("");
   const [ownership, setOwnership] = useState<"all" | "mine" | "others">("all");
+  const [concepts, setConcepts] = useState<OntologyConcept[]>([]);
+  const [conceptError, setConceptError] = useState("");
+  const [editingConcept, setEditingConcept] = useState<OntologyConcept | null | undefined>(undefined);
+  const [conceptLabel, setConceptLabel] = useState("");
+  const [conceptDefinition, setConceptDefinition] = useState("");
+  const [savingConcept, setSavingConcept] = useState(false);
   const agents: NodeType[] = ["PrincipalAgent", "AuxiliaryAgent", "SupportAgent"];
-  const nodes = snapshot.nodes.filter((node) => {
+  const visibleDataSections = canManageValueChains(user)
+    ? dataSections
+    : dataSections.filter((item) => item.id !== "ValueChain");
+  const sectionSnapshot = section === "ValueChain" ? globalSnapshot : snapshot;
+  const nodes = sectionSnapshot.nodes.filter((node) => {
     const inSection =
       section === "Agent" ? agents.includes(node.type) : node.type === section;
     const ownerMatch =
       ownership === "all" ||
       (ownership === "mine" ? node.owner_id === user.id : node.owner_id !== user.id);
     return inSection && ownerMatch &&
-      `${node.name} ${node.description} ${node.definition ?? ""} ${node.owner_name}`
+      `${node.name} ${node.identification ?? ""} ${node.description} ${node.evaluation ?? ""} ${node.owner_name}`
         .toLowerCase().includes(query.toLowerCase());
   });
-  const count = nodes.length;
+  const visibleConcepts = concepts
+    .filter((concept) =>
+      `${concept.label} ${concept.definition}`.toLowerCase().includes(query.toLowerCase())
+    )
+    .sort((left, right) => left.label.localeCompare(right.label, "es", { sensitivity: "base" }));
+  const count = section === "Definitions" ? visibleConcepts.length : nodes.length;
+
+  const loadConcepts = useCallback(async () => {
+    try {
+      setConcepts(await api.concepts());
+      setConceptError("");
+    } catch (error) {
+      setConceptError(error instanceof Error ? error.message : "No se pudieron cargar las definiciones");
+    }
+  }, []);
+
+  useEffect(() => { void loadConcepts(); }, [loadConcepts]);
+
+  function openConcept(concept: OntologyConcept | null) {
+    setEditingConcept(concept);
+    setConceptLabel(concept?.label ?? "");
+    setConceptDefinition(concept?.definition ?? "");
+    setConceptError("");
+  }
+
+  async function saveConcept(event: FormEvent) {
+    event.preventDefault();
+    setSavingConcept(true);
+    setConceptError("");
+    try {
+      const body = { label: conceptLabel.trim(), definition: conceptDefinition.trim() };
+      if (editingConcept) await api.updateConcept(editingConcept.iri, body);
+      else await api.createConcept(body);
+      setEditingConcept(undefined);
+      await loadConcepts();
+    } catch (error) {
+      setConceptError(error instanceof Error ? error.message : "No se pudo guardar el concepto");
+    } finally {
+      setSavingConcept(false);
+    }
+  }
+
+  async function toggleConceptVisibility(concept: OntologyConcept) {
+    setConceptError("");
+    try {
+      await api.updateConceptVisibility(concept.iri, !concept.visible);
+      await loadConcepts();
+    } catch (error) {
+      setConceptError(error instanceof Error ? error.message : "No se pudo cambiar la visibilidad");
+    }
+  }
+
+  async function deleteConcept(concept: OntologyConcept) {
+    if (!window.confirm(`¿Quieres borrar el concepto «${concept.label}»? Esta acción también eliminará sus relaciones en la ontología.`)) return;
+    setConceptError("");
+    try {
+      await api.deleteConcept(concept.iri);
+      await loadConcepts();
+    } catch (error) {
+      setConceptError(error instanceof Error ? error.message : "No se pudo borrar el concepto");
+    }
+  }
   const namesForIds = (ids: string[]) => [...new Set(ids)]
     .map((id) => snapshot.nodes.find((node) => node.id === id)?.name)
     .filter((name): name is string => Boolean(name))
     .sort((left, right) => left.localeCompare(right, "es"));
   const valueChainLinkNames = (chainId: string) => {
-    const linkIds = snapshot.relations.flatMap((edge) => {
+    const linkIds = globalSnapshot.relations.flatMap((edge) => {
       if (edge.type === "hasValueChainLink" && edge.source === chainId) return [edge.target];
       if (edge.type === "isValueChainLinkOf" && edge.target === chainId) return [edge.source];
       return [];
     });
-    return namesForIds(linkIds);
+    return [...new Set(linkIds)]
+      .map((id) => globalSnapshot.nodes.find((node) => node.id === id)?.name)
+      .filter((name): name is string => Boolean(name))
+      .sort((left, right) => left.localeCompare(right, "es"));
   };
   const valueChainName = (linkId: string) => {
     const chainIds = snapshot.relations.flatMap((edge) => {
@@ -1284,21 +1539,14 @@ function DataWorkspace({
     });
     return namesForIds(chainIds)[0];
   };
-  const previousLinkNames = (linkId: string) => namesForIds(
-    snapshot.relations
-      .filter((edge) => edge.type === "precedes" && edge.target === linkId)
-      .map((edge) => edge.source)
-  );
-  const nextLinkNames = (linkId: string) => namesForIds(
-    snapshot.relations
-      .filter((edge) => edge.type === "precedes" && edge.source === linkId)
-      .map((edge) => edge.target)
-  );
-  const linkKpiNames = (linkId: string) => namesForIds(
-    snapshot.relations
-      .filter((edge) => edge.type === "appliesToValueChainLink" && edge.target === linkId)
-      .map((edge) => edge.source)
-  );
+  const linkRelationDescriptions = (linkId: string) => snapshot.relations
+    .filter((edge) => linkRelationTypes.includes(edge.type) && (edge.source === linkId || edge.target === linkId))
+    .map((edge) => {
+      const otherId = edge.source === linkId ? edge.target : edge.source;
+      const otherName = snapshot.nodes.find((node) => node.id === otherId)?.name ?? otherId;
+      return `${otherName} (${relationLabels[edge.type]})`;
+    })
+    .sort((left, right) => left.localeCompare(right, "es"));
   const scopeComponentNames = (scopeId: string) => namesForIds(
     snapshot.relations.flatMap((edge) => {
       if (edge.type === "hasComponent" && edge.source === scopeId) return [edge.target];
@@ -1341,6 +1589,13 @@ function DataWorkspace({
       return [];
     })
   );
+  const linkAgentNames = (linkId: string) => namesForIds(
+    snapshot.relations.flatMap((edge) => {
+      if ((edge.type === "belongsTo" || edge.type === "participatesInValueChainLink") && edge.target === linkId) return [edge.source];
+      if ((edge.type === "hasPrincipalAgent" || edge.type === "hasParticipatingAgent") && edge.source === linkId) return [edge.target];
+      return [];
+    })
+  );
   const agentKpiNames = (agentId: string) => namesForIds(
     snapshot.relations.flatMap((edge) => {
       if (edge.type === "hasAssociatedKPI" && edge.source === agentId) return [edge.target];
@@ -1362,11 +1617,6 @@ function DataWorkspace({
       return [];
     })
   );
-  const kpiLinkNames = (kpiId: string) => namesForIds(
-    snapshot.relations
-      .filter((edge) => edge.type === "appliesToValueChainLink" && edge.source === kpiId)
-      .map((edge) => edge.target)
-  );
   const renderNamePills = (names: string[]) => names.length ? (
     <span className="entity-pills">
       {names.map((name, index) => (
@@ -1382,7 +1632,7 @@ function DataWorkspace({
     section === "Scope" ? [{ type: "Scope", label: "Crear ámbito" }] :
     section === "Component" ? [{ type: "Component", label: "Crear componente" }] :
     section === "KPI" ? [{ type: "KPI", label: "Crear KPI" }] :
-    section === "Agent" ? [{ type: "PrincipalAgent", label: "Crear agente" }] :
+    section === "Agent" && hasSpecialPermissions(user) ? [{ type: "PrincipalAgent", label: "Crear agente" }] :
     section === "ValueChain" && canManageValueChains(user) ? [{ type: "ValueChain", label: "Crear cadena" }] :
     section === "ValueChainLink" && canManageValueChains(user) ? [{ type: "ValueChainLink", label: "Crear eslabón" }] :
     [];
@@ -1407,9 +1657,8 @@ function DataWorkspace({
           Nombre: node.name,
           Descripción: node.description,
           Cadena: valueChainName(node.id) ?? "",
-          "Eslabones anteriores": join(previousLinkNames(node.id)),
-          "Eslabones posteriores": join(nextLinkNames(node.id)),
-          KPI: join(linkKpiNames(node.id)),
+          "Relación con otros eslabones": join(linkRelationDescriptions(node.id)),
+          Agentes: join(linkAgentNames(node.id)),
           Autor: node.owner_name
         }))
       },
@@ -1448,21 +1697,22 @@ function DataWorkspace({
         name: "KPI",
         rows: byType(["KPI"]).map((node) => ({
           Nombre: node.name,
-          Definición: node.definition ?? "",
+          Identificación: node.identification ?? "",
+          Descripción: node.description,
+          Evaluación: node.evaluation ?? "",
           Componentes: join(kpiComponentNames(node.id)),
           Agentes: join(kpiAgentNames(node.id)),
-          Eslabones: join(kpiLinkNames(node.id)),
           Autor: node.owner_name
         }))
       }
     ];
     const headers: Record<string, string[]> = {
       Cadenas: ["Nombre", "Descripción", "Eslabones", "Autor"],
-      Eslabones: ["Nombre", "Descripción", "Cadena", "Eslabones anteriores", "Eslabones posteriores", "KPI", "Autor"],
+      Eslabones: ["Nombre", "Descripción", "Cadena", "Relación con otros eslabones", "Agentes", "Autor"],
       Ámbitos: ["Nombre", "Descripción", "Componentes", "Autor"],
       Componentes: ["Nombre", "Descripción", "Ámbitos", "Supercomponentes", "Subcomponentes", "KPI", "Autor"],
       Agentes: ["Nombre", "Descripción", "Eslabones", "KPI", "Autor"],
-      KPI: ["Nombre", "Definición", "Componentes", "Agentes", "Eslabones", "Autor"]
+      KPI: ["Nombre", "Identificación", "Descripción", "Evaluación", "Componentes", "Agentes", "Autor"]
     };
     sheets.forEach(({ name, rows }) => {
       XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(rows, { header: headers[name] }), name);
@@ -1489,22 +1739,34 @@ function DataWorkspace({
   return (
     <section className="data-workspace">
       <aside className="data-nav">
-        <span className="section-label">Modelo de datos</span>
-        {dataSections.map((item) => (
+        {visibleDataSections.slice(0, 1).map((item) => (
           <button key={item.id} className={section === item.id ? "active" : ""} onClick={() => setSection(item.id)}>
             {item.label}
           </button>
         ))}
-        <span className="data-nav-divider">Exportación</span>
-        <button className="export-tables" onClick={exportExcel}>
-          <FileSpreadsheet /> Exportar tablas a Excel
-        </button>
+        <span className="data-nav-separator" aria-hidden="true" />
+        {visibleDataSections.slice(1).map((item) => (
+          <button key={item.id} className={section === item.id ? "active" : ""} onClick={() => setSection(item.id)}>
+            {item.label}
+          </button>
+        ))}
+        {hasSpecialPermissions(user) && (
+          <>
+            <span className="data-nav-divider">Exportación</span>
+            <button className="export-tables" onClick={exportExcel}>
+              <FileSpreadsheet /> Exportar tablas a Excel
+            </button>
+          </>
+        )}
       </aside>
       <div className="data-content">
         <div className="data-heading">
           <div><span>VISTA DE DATOS</span><h1>{dataSections.find((item) => item.id === section)?.label}</h1>
-            <p>Consulta datos propios y ajenos sobre el mismo RDF colaborativo.</p></div>
+            <p>{section === "Definitions" ? "Consulta las clases y definiciones vigentes de la ontología." : "Consulta datos propios y ajenos sobre el mismo RDF colaborativo."}</p></div>
           <div className="creation-actions">
+            {section === "Definitions" && hasSpecialPermissions(user) && (
+              <button className="primary" onClick={() => openConcept(null)}><Plus /> Crear concepto</button>
+            )}
             {creationActions.map((action) => (
               <button className="primary" onClick={() => onCreateNode(action.type)} key={action.type}>
                 <Plus /> {action.label}
@@ -1512,22 +1774,35 @@ function DataWorkspace({
             ))}
           </div>
         </div>
-        <div className="data-summary">
+        {section !== "Definitions" && <div className="data-summary">
           <div><span>Resultados</span><strong>{count}</strong></div>
           <div><span>Propios</span><strong>{nodes.filter((node) => node.owner_id === user.id).length}</strong></div>
           <div><span>Reutilizables</span><strong>{nodes.filter((node) => node.owner_id !== user.id).length}</strong></div>
-        </div>
+        </div>}
         <div className="data-card">
           <div className="data-toolbar">
-            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Buscar por nombre, descripción o autor…" />
-            <div className="segmented">
+            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={section === "Definitions" ? "Buscar concepto o definición…" : "Buscar por nombre, descripción o autor…"} />
+            {section !== "Definitions" && <div className="segmented">
               <button className={ownership === "all" ? "active" : ""} onClick={() => setOwnership("all")}>Todos</button>
               <button className={ownership === "mine" ? "active" : ""} onClick={() => setOwnership("mine")}>Mis datos</button>
               <button className={ownership === "others" ? "active" : ""} onClick={() => setOwnership("others")}>Otros usuarios</button>
-            </div>
+            </div>}
           </div>
           <div className="data-table-wrap">
-            {section === "ValueChain" ? (
+            {section === "Definitions" ? (
+              <table className="definitions-table">
+                <thead><tr><th>Concepto</th><th>Definición</th>{hasSpecialPermissions(user) && <th>Acciones</th>}</tr></thead>
+                <tbody>{visibleConcepts.map((concept) => <tr key={concept.iri}>
+                  <td><strong>{concept.label}</strong></td>
+                  <td>{concept.definition || "—"}</td>
+                  {hasSpecialPermissions(user) && <td><div className="table-actions">
+                    <button className="table-action" onClick={() => openConcept(concept)}><Pencil /> Editar</button>
+                    {isAdmin(user) && <button className="table-action" onClick={() => void toggleConceptVisibility(concept)}>{concept.visible ? "Ocultar a usuarios" : "Hacer visible"}</button>}
+                    {concept.deletable && <button className="table-action danger" onClick={() => void deleteConcept(concept)}>Borrar</button>}
+                  </div></td>}
+                </tr>)}</tbody>
+              </table>
+            ) : section === "ValueChain" ? (
               <table><thead><tr><th>Nombre</th><th>Descripción</th><th>Eslabones</th><th>Autor</th><th>Acciones</th></tr></thead>
                 <tbody>{nodes.map((node) => <tr key={node.id} className={node.editable ? "mine-row" : ""}>
                   <td><strong>{node.name}</strong></td>
@@ -1535,7 +1810,13 @@ function DataWorkspace({
                   <td>{renderNamePills(valueChainLinkNames(node.id))}</td>
                   <td>{node.owner_name}{node.editable && <b className="mine-tag">Tuyo</b>}</td>
                   <td><div className="table-actions">
-                    <button className="table-action" onClick={() => onSelect(node.id)}>Ver grafo</button>
+                    <button
+                      className={`table-action activate-chain-action ${activeChainId === node.id ? "active" : ""}`}
+                      disabled={activeChainId === node.id}
+                      onClick={() => onActivateChain(node.id)}
+                    >
+                      {activeChainId === node.id ? "Cadena activa" : "Activar cadena"}
+                    </button>
                     {node.editable && <>
                       <button className="table-action" onClick={() => onEditNode(node)}><Pencil /> Editar</button>
                       <button className="table-action danger-action" onClick={() => onDeleteNode(node)}><Trash2 /> Borrar</button>
@@ -1545,14 +1826,12 @@ function DataWorkspace({
               </table>
             ) : section === "ValueChainLink" ? (
               <table className="value-chain-link-table">
-                <thead><tr><th>Nombre</th><th>Descripción</th><th>Cadena</th><th>Eslabones anteriores</th><th>Eslabones posteriores</th><th>KPI</th><th>Autor</th><th>Acciones</th></tr></thead>
+                <thead><tr><th>Nombre</th><th>Descripción</th><th>Relación con otros eslabones</th><th>Agentes</th><th>Autor</th><th>Acciones</th></tr></thead>
                 <tbody>{nodes.map((node) => <tr key={node.id} className={node.editable ? "mine-row" : ""}>
                   <td><strong>{node.name}</strong></td>
                   <td>{node.description || "—"}</td>
-                  <td>{renderNamePill(valueChainName(node.id))}</td>
-                  <td>{renderNamePills(previousLinkNames(node.id))}</td>
-                  <td>{renderNamePills(nextLinkNames(node.id))}</td>
-                  <td>{renderNamePills(linkKpiNames(node.id))}</td>
+                  <td>{renderNamePills(linkRelationDescriptions(node.id))}</td>
+                  <td>{renderNamePills(linkAgentNames(node.id))}</td>
                   <td>{node.owner_name}{node.editable && <b className="mine-tag">Tuyo</b>}</td>
                   <td><div className="table-actions">
                     <button className="table-action" onClick={() => onSelect(node.id)}>Ver grafo</button>
@@ -1611,7 +1890,9 @@ function DataWorkspace({
                   <td><div className="table-actions">
                     <button className="table-action" onClick={() => onSelect(node.id)}>Ver grafo</button>
                     {node.editable && <>
-                      <button className="table-action" onClick={() => onEditNode(node)}><Pencil /> Editar</button>
+                      {(node.type !== "AuxiliaryAgent" || hasSpecialPermissions(user)) && (
+                        <button className="table-action" onClick={() => onEditNode(node)}><Pencil /> Editar</button>
+                      )}
                       <button className="table-action danger-action" onClick={() => onDeleteNode(node)}><Trash2 /> Borrar</button>
                     </>}
                   </div></td>
@@ -1619,13 +1900,14 @@ function DataWorkspace({
               </table>
             ) : section === "KPI" ? (
               <table className="kpi-table">
-                <thead><tr><th>Nombre</th><th>Definición</th><th>Componentes</th><th>Agentes</th><th>Eslabones</th><th>Autor</th><th>Acciones</th></tr></thead>
+                <thead><tr><th>Nombre</th><th>Identificación</th><th>Descripción</th><th>Evaluación</th><th>Componentes</th><th>Agentes</th><th>Autor</th><th>Acciones</th></tr></thead>
                 <tbody>{nodes.map((node) => <tr key={node.id} className={node.editable ? "mine-row" : ""}>
                   <td><strong>{node.name}</strong></td>
-                  <td>{node.definition || "—"}</td>
+                  <td>{node.identification || "—"}</td>
+                  <td>{node.description || "—"}</td>
+                  <td>{node.evaluation || "—"}</td>
                   <td>{renderNamePills(kpiComponentNames(node.id))}</td>
                   <td>{renderNamePills(kpiAgentNames(node.id))}</td>
-                  <td>{renderNamePills(kpiLinkNames(node.id))}</td>
                   <td>{node.owner_name}{node.editable && <b className="mine-tag">Tuyo</b>}</td>
                   <td><div className="table-actions">
                     <button className="table-action" onClick={() => onSelect(node.id)}>Ver grafo</button>
@@ -1639,7 +1921,7 @@ function DataWorkspace({
             ) : (
               <table><thead><tr><th>Nombre</th><th>Descripción / definición</th><th>Relaciones</th><th>Autor</th><th>Acciones</th></tr></thead>
                 <tbody>{nodes.map((node) => <tr key={node.id} className={node.editable ? "mine-row" : ""}>
-                  <td><strong>{node.name}</strong></td><td>{node.definition || node.description || "—"}</td>
+                  <td><strong>{node.name}</strong></td><td>{node.description || "—"}</td>
                   <td>{snapshot.relations.filter((edge) => edge.source === node.id || edge.target === node.id).length}</td>
                   <td>{node.owner_name}{node.editable && <b className="mine-tag">Tuyo</b>}</td>
                   <td><div className="table-actions">
@@ -1655,9 +1937,190 @@ function DataWorkspace({
             {!count && <div className="data-empty">No hay registros que coincidan con los filtros.</div>}
           </div>
         </div>
+        {conceptError && <div className="error concept-error">{conceptError}</div>}
       </div>
+      {editingConcept !== undefined && createPortal(
+        <div className="overlay" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget) setEditingConcept(undefined);
+        }}>
+          <form className="dialog concept-dialog" onSubmit={saveConcept} role="dialog" aria-modal="true" aria-labelledby="concept-dialog-title">
+            <div className="dialog-title">
+              <div>
+                <strong id="concept-dialog-title">{editingConcept ? "Editar concepto" : "Crear concepto"}</strong>
+                <span>Clase de la ontología. La etiqueta y la definición se guardarán en español.</span>
+              </div>
+              <button type="button" className="icon" aria-label="Cerrar" onClick={() => setEditingConcept(undefined)}><X /></button>
+            </div>
+            <label htmlFor="concept-label">Concepto</label>
+            <input id="concept-label" autoFocus required maxLength={200} value={conceptLabel} onChange={(event) => setConceptLabel(event.target.value)} />
+            <label htmlFor="concept-definition">Definición</label>
+            <textarea id="concept-definition" required maxLength={4000} rows={7} value={conceptDefinition} onChange={(event) => setConceptDefinition(event.target.value)} />
+            {conceptError && <div className="error">{conceptError}</div>}
+            <div className="dialog-actions">
+              <button type="button" className="secondary" onClick={() => setEditingConcept(undefined)}>Cancelar</button>
+              <button className="primary" disabled={savingConcept}>{savingConcept ? "Guardando…" : editingConcept ? "Guardar cambios" : "Crear concepto"}</button>
+            </div>
+          </form>
+        </div>,
+        document.body
+      )}
     </section>
   );
+}
+
+function normalizedSearchText(value: string) {
+  return value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLocaleLowerCase("es").trim();
+}
+
+function editDistance(left: string, right: string) {
+  const row = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= left.length; i += 1) {
+    let diagonal = row[0];
+    row[0] = i;
+    for (let j = 1; j <= right.length; j += 1) {
+      const previous = row[j];
+      row[j] = Math.min(row[j] + 1, row[j - 1] + 1, diagonal + (left[i - 1] === right[j - 1] ? 0 : 1));
+      diagonal = previous;
+    }
+  }
+  return row[right.length];
+}
+
+function searchScore(name: string, query: string) {
+  const candidate = normalizedSearchText(name);
+  const term = normalizedSearchText(query);
+  if (!term) return 0;
+  if (candidate === term) return 1000;
+  if (candidate.startsWith(term)) return 800 - candidate.length;
+  if (candidate.includes(term)) return 600 - candidate.indexOf(term);
+  return 300 - editDistance(candidate, term) * 12;
+}
+
+function ExploreWorkspace({ snapshot }: { snapshot: Snapshot }) {
+  const availableTypes = useMemo(() => (Object.keys(typeInfo) as NodeType[])
+    .filter((type) => type !== "ValueChain" && snapshot.nodes.some((node) => node.type === type)), [snapshot.nodes]);
+  const [nodeType, setNodeType] = useState<NodeType | "">("");
+  const [query, setQuery] = useState("");
+  const [suggestionsOpen, setSuggestionsOpen] = useState(false);
+  const [visibleIds, setVisibleIds] = useState<Set<string>>(new Set());
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const searchBox = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const closeSuggestions = (event: PointerEvent) => {
+      if (searchBox.current && !searchBox.current.contains(event.target as Node)) setSuggestionsOpen(false);
+    };
+    document.addEventListener("pointerdown", closeSuggestions);
+    return () => document.removeEventListener("pointerdown", closeSuggestions);
+  }, []);
+
+  useEffect(() => {
+    setNodeType("");
+    setQuery("");
+    setVisibleIds(new Set());
+    setExpandedIds(new Set());
+    setSelectedId(null);
+  }, [snapshot]);
+
+  const suggestions = useMemo(() => {
+    if (!nodeType) return [];
+    return snapshot.nodes
+      .filter((node) => node.type === nodeType)
+      .map((node) => ({ node, score: query ? searchScore(node.name, query) : 0 }))
+      .filter(({ score }) => !query || score > 100)
+      .sort((left, right) => right.score - left.score || left.node.name.localeCompare(right.node.name, "es"))
+      .slice(0, 8)
+      .map(({ node }) => node);
+  }, [nodeType, query, snapshot.nodes]);
+
+  const neighboursOf = useCallback((nodeId: string) => snapshot.relations.flatMap((edge) => {
+    if (edge.source === nodeId) return [edge.target];
+    if (edge.target === nodeId) return [edge.source];
+    return [];
+  }), [snapshot.relations]);
+
+  const chooseStartNode = (node: GraphNode) => {
+    setQuery(node.name);
+    setSuggestionsOpen(false);
+    setSelectedId(node.id);
+    setExpandedIds(new Set([node.id]));
+    setVisibleIds(new Set([node.id, ...neighboursOf(node.id)]));
+  };
+
+  const expandNode = useCallback((nodeId: string) => {
+    setSelectedId(nodeId);
+    setExpandedIds((current) => new Set(current).add(nodeId));
+    setVisibleIds((current) => new Set([...current, nodeId, ...neighboursOf(nodeId)]));
+  }, [neighboursOf]);
+
+  const exploredSnapshot = useMemo(() => {
+    const nodes = snapshot.nodes.filter((node) => visibleIds.has(node.id));
+    const nodeIds = new Set(nodes.map((node) => node.id));
+    return { ...snapshot, nodes, relations: snapshot.relations.filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target)) };
+  }, [snapshot, visibleIds]);
+
+  const selectedNode = snapshot.nodes.find((node) => node.id === selectedId) ?? null;
+  const pendingNeighbours = selectedNode ? neighboursOf(selectedNode.id).filter((id) => !visibleIds.has(id)).length : 0;
+
+  return <section className="explore-workspace">
+    <aside className="explore-controls">
+      <div className="panel-title"><span>Explorar el grafo</span><Search /></div>
+      <p className="explore-help">Elige un tipo y busca el nodo desde el que quieres comenzar.</p>
+      <label>Tipo de nodo
+        <select value={nodeType} onChange={(event) => { setNodeType(event.target.value as NodeType); setQuery(""); setSuggestionsOpen(false); }}>
+          <option value="">Selecciona un tipo…</option>
+          {availableTypes.map((type) => <option key={type} value={type}>{typeInfo[type].label}</option>)}
+        </select>
+      </label>
+      <label>Nodo</label>
+      <div className="explore-search" ref={searchBox}>
+        <Search />
+        <input
+          value={query}
+          disabled={!nodeType}
+          placeholder={nodeType ? `Buscar ${typeInfo[nodeType].label.toLocaleLowerCase("es")}…` : "Selecciona primero un tipo"}
+          onFocus={() => setSuggestionsOpen(Boolean(nodeType))}
+          onChange={(event) => { setQuery(event.target.value); setSuggestionsOpen(true); }}
+          aria-autocomplete="list"
+          aria-expanded={suggestionsOpen}
+        />
+        {suggestionsOpen && nodeType && <div className="explore-suggestions" role="listbox">
+          {suggestions.map((node) => <button key={node.id} type="button" onClick={() => chooseStartNode(node)}>
+            <i className={`type-${node.type.toLowerCase()}`} /><span><strong>{node.name}</strong><small>{typeInfo[node.type].label}</small></span>
+          </button>)}
+          {!suggestions.length && <p>No se encontraron nodos parecidos.</p>}
+        </div>}
+      </div>
+      <div className="explore-instructions">
+        <span className="section-label">Cómo explorar</span>
+        <p>Selecciona un resultado para mostrar sus vecinos.</p>
+        <p>Pulsa cualquier nodo del grafo para desplegar sus propias conexiones.</p>
+      </div>
+      {visibleIds.size > 0 && <button className="secondary wide" onClick={() => { setVisibleIds(new Set()); setExpandedIds(new Set()); setSelectedId(null); setQuery(""); }}><FilterX /> Reiniciar exploración</button>}
+    </aside>
+    <section className="canvas explore-canvas">
+      <div className="canvas-toolbar">
+        <div><span><CircleDot /> {exploredSnapshot.nodes.length} nodos</span><span><GitBranch /> {exploredSnapshot.relations.length} relaciones</span><span>{expandedIds.size} expandidos</span></div>
+        {selectedNode && <span className="explore-toolbar-hint">Pulsa un nodo para expandirlo</span>}
+      </div>
+      {visibleIds.size ? <GraphCanvas snapshot={exploredSnapshot} selected={selectedId} onSelect={(id) => id ? expandNode(id) : setSelectedId(null)} /> : <div className="explore-empty"><Search /><strong>Busca un nodo para comenzar</strong><span>Aparecerá junto a todos sus vecinos directos.</span></div>}
+    </section>
+    <aside className="inspector explore-inspector">
+      <div className="panel-title"><span>Nodo seleccionado</span></div>
+      {selectedNode ? <>
+        <div className="inspector-head">
+          <div className={`inspector-mark type-${selectedNode.type.toLowerCase()}`}><i /></div>
+          <span>{typeInfo[selectedNode.type].label}</span><h2>{selectedNode.name}</h2>
+          <p>{selectedNode.description || "Sin descripción"}</p>
+        </div>
+        <div className="metadata">
+          {selectedNode.type === "KPI" && <><label>Identificación</label><p>{selectedNode.identification || "—"}</p><label>Evaluación</label><p>{selectedNode.evaluation || "—"}</p></>}
+          <label>Estado</label><p>{expandedIds.has(selectedNode.id) ? "Vecindario expandido" : "Pendiente de expandir"}</p><label>Conexiones aún ocultas</label><p>{pendingNeighbours}</p><label>Autor</label><div className="author"><b>{selectedNode.owner_initials}</b><span>{selectedNode.owner_name}</span></div>
+        </div>
+      </> : <div className="empty-inspector"><CircleDot /><span>Selecciona o expande un nodo para consultar sus detalles.</span></div>}
+    </aside>
+  </section>;
 }
 
 function Workspace({
@@ -1671,22 +2134,25 @@ function Workspace({
 }) {
   const [snapshot, setSnapshot] = useState<Snapshot>(emptySnapshot);
   const [users, setUsers] = useState<User[]>([]);
-  const [units, setUnits] = useState<UnitOption[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [dialog, setDialog] = useState<"node" | "relation" | "password" | "users" | null>(null);
   const [editingNode, setEditingNode] = useState<GraphNode | null>(null);
   const [createType, setCreateType] = useState<NodeType>("Scope");
   const [connected, setConnected] = useState(1);
-  const [filters, setFilters] = useState<Filters>({ scope: "", user: "", type: "", node: "" });
+  const [filters, setFilters] = useState<Filters>(emptyFilters);
   const [error, setError] = useState("");
-  const [view, setView] = useState<"data" | "graph">("data");
+  const [view, setView] = useState<"data" | "graph" | "explore">("data");
+  const [remoteChange, setRemoteChange] = useState<string | null>(null);
+  const [activeChainId, setActiveChainId] = useState<string | null>(() => localStorage.getItem(`orca-active-chain-${user.id}`));
+  const [chainPickerOpen, setChainPickerOpen] = useState(false);
+  const [chainQuery, setChainQuery] = useState("");
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (clearRemoteChange = false) => {
     try {
-      const [graph, people, unitOptions] = await Promise.all([api.graph(), api.users(), api.units()]);
+      const [graph, people] = await Promise.all([api.graph(), api.users()]);
       setSnapshot(graph);
       setUsers(people);
-      setUnits(unitOptions);
+      if (clearRemoteChange) setRemoteChange(null);
       setError("");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "No se pudo cargar el grafo");
@@ -1699,16 +2165,54 @@ function Workspace({
     const socket = new WebSocket(`${protocol}://${location.host}/api/ws`);
     socket.onmessage = (event) => {
       const message = JSON.parse(event.data);
-      if (message.type === "graph.changed") load();
+      if (message.type === "graph.changed" && message.actor?.id !== user.id) {
+        setRemoteChange(`${message.actor?.display_name ?? "Otro usuario"} ha modificado el grafo.`);
+      }
       if (message.type === "presence.changed") setConnected(message.connected);
     };
     return () => socket.close();
-  }, [load]);
+  }, [load, user.id]);
 
-  const filtered = useMemo(() => filterGraph(snapshot, filters), [snapshot, filters]);
-  const scopes = snapshot.nodes.filter((node) => node.type === "Scope");
-  const selectedNode = snapshot.nodes.find((node) => node.id === selected);
-  const selectedRelations = snapshot.relations.filter((edge) => edge.source === selected || edge.target === selected);
+  const refreshGraph = useCallback(() => load(true), [load]);
+
+  const chains = snapshot.nodes
+    .filter((node) => node.type === "ValueChain")
+    .sort((left, right) => left.name.localeCompare(right.name, "es"));
+  const activeChain = chains.find((chain) => chain.id === activeChainId) ?? null;
+  const visibleChains = chains.filter((chain) =>
+    `${chain.name} ${chain.description}`.toLocaleLowerCase("es")
+      .includes(chainQuery.trim().toLocaleLowerCase("es"))
+  );
+  const chainSnapshot = useMemo(() => snapshotForChain(snapshot, activeChain?.id ?? null), [snapshot, activeChain?.id]);
+  const workspaceSnapshot = useMemo(() => activeChain
+    ? { ...chainSnapshot, nodes: [activeChain, ...chainSnapshot.nodes] }
+    : chainSnapshot, [chainSnapshot, activeChain]);
+
+  useEffect(() => {
+    if (activeChainId && chains.length && !chains.some((chain) => chain.id === activeChainId)) {
+      setActiveChainId(null);
+      localStorage.removeItem(`orca-active-chain-${user.id}`);
+    }
+  }, [activeChainId, chains, user.id]);
+
+  const activateChain = (chainId: string) => {
+    setActiveChainId(chainId);
+    localStorage.setItem(`orca-active-chain-${user.id}`, chainId);
+    setSelected(null);
+    setFilters(emptyFilters);
+    setChainPickerOpen(false);
+    setChainQuery("");
+  };
+
+  const openChainPicker = () => {
+    setChainQuery("");
+    setChainPickerOpen(true);
+  };
+
+  const filtered = useMemo(() => filterGraph(chainSnapshot, filters), [chainSnapshot, filters]);
+  const scopes = chainSnapshot.nodes.filter((node) => node.type === "Scope");
+  const selectedNode = chainSnapshot.nodes.find((node) => node.id === selected);
+  const selectedRelations = chainSnapshot.relations.filter((edge) => edge.source === selected || edge.target === selected);
   const selectedDegree = selectedNode
     ? new Set(
         selectedRelations.map((edge) =>
@@ -1716,9 +2220,10 @@ function Workspace({
         )
       ).size
     : 0;
-  const setFilter = (key: keyof Filters, value: string) =>
+  const setFilter = <K extends keyof Filters>(key: K, value: Filters[K]) =>
     setFilters((current) => ({ ...current, [key]: value }));
   const openCreate = (type: NodeType) => {
+    if (type !== "ValueChain" && !activeChain) return;
     setEditingNode(null);
     setCreateType(type);
     setDialog("node");
@@ -1756,12 +2261,12 @@ function Workspace({
     <main className="app-shell">
       <header className="topbar">
         <div className="brand">
-          <RdfMark />
-          <div><strong><em>ORCA</em> Graph</strong><span>Ontology-Restricted Collaborative Authoring of Graphs</span></div>
+          <img src="/assets/orca-graph-logo.webp" alt="ORCA Graph" />
         </div>
         <nav className="view-tabs" aria-label="Cambiar de vista">
           <button className={view === "data" ? "active" : ""} onClick={() => setView("data")}>▤ Vista de datos</button>
           <button className={view === "graph" ? "active" : ""} onClick={() => setView("graph")}>⌘ Vista de grafo</button>
+          <button className={view === "explore" ? "active" : ""} onClick={() => setView("explore")}><Search /> Explorar</button>
         </nav>
         <div className="presence"><i /> {connected} colaboradores conectados</div>
         <div className="top-actions">
@@ -1777,15 +2282,31 @@ function Workspace({
         </div>
       </header>
 
+      <section className="active-chain-bar">
+        <div className="active-chain-summary"><span>Cadena activa</span><strong>{activeChain?.name ?? "Selecciona una cadena para comenzar"}</strong></div>
+        <button type="button" className="active-chain-switcher" onClick={openChainPicker}>
+          <span>
+            <strong>{activeChain?.name ?? "Seleccionar cadena"}</strong>
+            <small>{activeChain?.description || "Consulta las cadenas disponibles y activa una"}</small>
+          </span>
+          <b>{activeChain ? "Cambiar" : "Seleccionar"}</b>
+        </button>
+      </section>
+
       {view === "data" ? (
         <DataWorkspace
-          snapshot={snapshot}
+          snapshot={workspaceSnapshot}
+          globalSnapshot={snapshot}
+          activeChainId={activeChainId}
           user={user}
           onSelect={(id) => { setSelected(id); setView("graph"); }}
+          onActivateChain={activateChain}
           onCreateNode={openCreate}
           onEditNode={openEdit}
           onDeleteNode={removeNode}
         />
+      ) : view === "explore" ? (
+        <ExploreWorkspace snapshot={chainSnapshot} />
       ) : <section className="workspace">
         <aside className="sidebar">
           <div className="panel-title"><span>Modelo v7</span><ShieldCheck /></div>
@@ -1793,37 +2314,24 @@ function Workspace({
             {(Object.keys(typeInfo) as NodeType[]).map((type) => (
               <div className={`type-row type-${type.toLowerCase()}`} key={type}>
                 <i /><span>{typeInfo[type].label}</span>
-                <b>{snapshot.nodes.filter((node) => node.type === type).length}</b>
+                <b>{chainSnapshot.nodes.filter((node) => node.type === type).length}</b>
               </div>
             ))}
           </div>
           <div className="filter-panel">
             <span className="section-label">Filtrar grafo</span>
-            <label>Ámbito
-              <select value={filters.scope} onChange={(e) => setFilter("scope", e.target.value)}>
-                <option value="">Todos los ámbitos</option>
-                {scopes.map((scope) => <option value={scope.id} key={scope.id}>{scope.name}</option>)}
-              </select>
-            </label>
-            <label>Usuario
-              <select value={filters.user} onChange={(e) => setFilter("user", e.target.value)}>
-                <option value="">Todos los usuarios</option>
-                {users.map((person) => <option value={person.id} key={person.id}>{person.display_name}</option>)}
-              </select>
-            </label>
-            <label>Tipo de nodo
-              <select value={filters.type} onChange={(e) => setFilter("type", e.target.value)}>
-                <option value="">Todos los tipos</option>
-                {(Object.keys(typeInfo) as NodeType[]).map((type) => <option value={type} key={type}>{typeInfo[type].label}</option>)}
-              </select>
-            </label>
-            <label>Nodo y vecindario
-              <select value={filters.node} onChange={(e) => setFilter("node", e.target.value)}>
-                <option value="">Todos los nodos</option>
-                {snapshot.nodes.map((node) => <option value={node.id} key={node.id}>{node.name}</option>)}
-              </select>
-            </label>
-            <button className="secondary wide" onClick={() => setFilters({ scope: "", user: "", type: "", node: "" })}>
+            <MultiFilterSelect label="Ámbito" options={scopes.map((scope) => ({ value: scope.id, label: scope.name }))} selected={filters.scope} onChange={(value) => setFilter("scope", value)} placeholder="Todos los ámbitos" />
+            <MultiFilterSelect label="Usuario" options={[
+              { value: "global", label: "Modelo compartido", detail: "Conceptos sin autor" },
+              ...users.map((person) => ({ value: person.id, label: person.display_name, detail: roleLabels[person.role] }))
+            ]} selected={filters.user} onChange={(value) => setFilter("user", value)} placeholder="Todos los usuarios" />
+            <MultiFilterSelect label="Tipo de nodo" options={(Object.keys(typeInfo) as NodeType[])
+              .filter((type) => type !== "ValueChain")
+              .map((type) => ({ value: type, label: typeInfo[type].label }))} selected={filters.type} onChange={(value) => setFilter("type", value)} placeholder="Todos los tipos" />
+            <MultiFilterSelect label="Nodo y vecindario" options={[...chainSnapshot.nodes]
+              .sort((left, right) => left.name.localeCompare(right.name, "es"))
+              .map((node) => ({ value: node.id, label: node.name, detail: `${typeInfo[node.type].label} · ${node.owner_name}` }))} selected={filters.node} onChange={(value) => setFilter("node", value)} placeholder="Todos los nodos" />
+            <button className="secondary wide" onClick={() => setFilters(emptyFilters)}>
               <FilterX /> Limpiar filtros
             </button>
           </div>
@@ -1843,9 +2351,17 @@ function Workspace({
               <span><GitBranch /> {filtered.relations.length} relaciones</span>
               <span><Users /> {users.length} autores</span>
             </div>
-            <button className="ghost" onClick={load}><Maximize2 /> Actualizar</button>
+            <button className={`ghost ${remoteChange ? "refresh-pending" : ""}`} onClick={refreshGraph}>
+              <Maximize2 /> Actualizar grafo{remoteChange ? " •" : ""}
+            </button>
           </div>
           <GraphCanvas snapshot={filtered} selected={selected} onSelect={setSelected} />
+          {remoteChange && (
+            <div className="graph-change-notice" role="status">
+              <span>{remoteChange} Pulsa «Actualizar grafo» para incorporar los cambios.</span>
+              <button type="button" onClick={refreshGraph}>Actualizar ahora</button>
+            </div>
+          )}
           {error && <div className="toast error">{error}</div>}
         </section>
 
@@ -1857,16 +2373,16 @@ function Workspace({
                 <div className={`inspector-mark type-${selectedNode.type.toLowerCase()}`}><i /></div>
                 <span>{typeInfo[selectedNode.type].label}</span>
                 <h2>{selectedNode.name}</h2>
-                <p>{selectedNode.definition || selectedNode.description || "Sin descripción"}</p>
+                <p>{selectedNode.description || "Sin descripción"}</p>
               </div>
               <div className="metadata">
+                {selectedNode.type === "KPI" && <><label>Identificación</label><p>{selectedNode.identification || "—"}</p><label>Evaluación</label><p>{selectedNode.evaluation || "—"}</p></>}
                 <label>Autor</label>
                 <div className="author"><b>{selectedNode.owner_initials}</b><span>{selectedNode.owner_name}</span></div>
                 <label>Permisos</label>
                 <p>{selectedNode.editable ? "Editable por ti" : "Visible en modo lectura"}</p>
                 <label>Conectividad</label>
                 <p>{selectedDegree} {selectedDegree === 1 ? "nodo vecino" : "nodos vecinos"}</p>
-                {selectedNode.unit_label && <><label>Unidad OM</label><p>{selectedNode.unit_label}</p></>}
                 {selectedNode.support_agent_subtype && (
                   <><label>Tipo de agente de apoyo</label><p>{supportAgentSubtypeLabels[selectedNode.support_agent_subtype]}</p></>
                 )}
@@ -1874,11 +2390,11 @@ function Workspace({
                 <div className="relation-list">
                   {selectedRelations.map((edge, index) => {
                     const otherId = edge.source === selectedNode.id ? edge.target : edge.source;
-                    const other = snapshot.nodes.find((node) => node.id === otherId);
+                    const other = chainSnapshot.nodes.find((node) => node.id === otherId);
                     return (
                       <div className="relation-item" key={`${edge.source}-${edge.type}-${edge.target}-${index}`}>
                         <span>{relationLabels[edge.type]} · {other?.name}</span>
-                        {edge.editable && (
+                        {edge.editable && (selectedNode.type !== "AuxiliaryAgent" || hasSpecialPermissions(user)) && (
                           <button
                             type="button"
                             className="icon-danger"
@@ -1894,7 +2410,9 @@ function Workspace({
                   })}
                 </div>
                 <label>IRI</label><code>{selectedNode.id}</code>
-                <button className="secondary wide" onClick={() => setDialog("relation")}><GitBranch /> Crear relación</button>
+                {(selectedNode.type !== "AuxiliaryAgent" || hasSpecialPermissions(user)) && (
+                  <button className="secondary wide" onClick={() => setDialog("relation")}><GitBranch /> Crear relación</button>
+                )}
                 {selectedNode.editable && (
                   <button className="danger wide" onClick={() => removeNode(selectedNode)}>
                     <Trash2 /> Borrar nodo
@@ -1920,15 +2438,37 @@ function Workspace({
         <div>
           <span className="app-version">ORCA Graph v{APP_VERSION}</span>
           <span><i className="line" /> Relación estructural</span>
-          <span><i className="line related" /> Similitud o aplicación</span>
+          <span><i className="line related" /> Relación entre conceptos</span>
           <span><i className="ownership mine" /> Creado por ti</span>
           <span><i className="ownership foreign" /> Otros autores</span>
           <span>Tamaño = nº de vecinos</span>
         </div>
       </footer>
 
-      {dialog === "node" && <NodeDialog initialType={createType} initialNode={editingNode} nodes={snapshot.nodes} relations={snapshot.relations} units={units} canManageValueChain={canManageValueChains(user)} onClose={() => { setDialog(null); setEditingNode(null); }} onCreated={load} />}
-      {dialog === "relation" && <RelationDialog nodes={snapshot.nodes} relations={snapshot.relations} canManageValueChain={canManageValueChains(user)} initialSource={selected} onClose={() => setDialog(null)} onCreated={load} />}
+      {(!activeChain || chainPickerOpen) && snapshot.nodes.length > 0 && (
+        <div className="overlay chain-picker-overlay" onMouseDown={(event) => {
+          if (event.target === event.currentTarget && activeChain) setChainPickerOpen(false);
+        }}>
+          <section className="dialog chain-picker" role="dialog" aria-modal="true" aria-labelledby="chain-picker-title">
+            <div className="dialog-title">
+              <div><strong id="chain-picker-title">Selecciona una cadena de valor</strong><span>Todo el contenido y el grafo se mostrarán dentro de la cadena activa.</span></div>
+              {activeChain && <button type="button" className="icon" aria-label="Cerrar selector de cadena" onClick={() => setChainPickerOpen(false)}><X /></button>}
+            </div>
+            <div className="chain-picker-search">
+              <Search />
+              <input autoFocus value={chainQuery} onChange={(event) => setChainQuery(event.target.value)} placeholder="Filtrar cadenas por nombre o descripción…" />
+            </div>
+            <div className="chain-picker-list">
+              {visibleChains.map((chain) => <button type="button" className={chain.id === activeChainId ? "active" : ""} key={chain.id} onClick={() => activateChain(chain.id)}><span><strong>{chain.name}</strong><small>{chain.description || "Sin descripción"}</small></span><b>{chain.id === activeChainId ? "Activa" : "Activar"}</b></button>)}
+              {!visibleChains.length && <p>{chains.length ? "No hay cadenas que coincidan con la búsqueda." : "No hay cadenas disponibles."}</p>}
+            </div>
+            {canManageValueChains(user) && <div className="dialog-actions"><button className="primary" onClick={() => openCreate("ValueChain")}><Plus /> Crear cadena</button></div>}
+          </section>
+        </div>
+      )}
+
+      {dialog === "node" && <NodeDialog initialType={createType} initialNode={editingNode} nodes={workspaceSnapshot.nodes} relations={snapshot.relations} activeChainId={activeChainId} canManageValueChain={canManageValueChains(user)} canManageRestrictedAgents={hasSpecialPermissions(user)} onClose={() => { setDialog(null); setEditingNode(null); }} onCreated={load} />}
+      {dialog === "relation" && <RelationDialog nodes={chainSnapshot.nodes} relations={chainSnapshot.relations} canManageValueChain={canManageValueChains(user)} initialSource={selected} onClose={() => setDialog(null)} onCreated={load} />}
       {dialog === "password" && <PasswordDialog onClose={() => setDialog(null)} onChanged={onPasswordChanged} />}
       {dialog === "users" && <UserAdminDialog currentUser={user} users={users} onClose={() => setDialog(null)} onChanged={load} />}
     </main>

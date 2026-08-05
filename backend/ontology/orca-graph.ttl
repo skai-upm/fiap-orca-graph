@@ -1,9 +1,13 @@
 @prefix orca: <https://orca-graph.example/ontology/> .
-@prefix om:   <http://www.ontology-of-units-of-measure.org/resource/om-2/> .
 @prefix owl:  <http://www.w3.org/2002/07/owl#> .
 @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
 @prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+
+orca:inValueChain a owl:ObjectProperty ;
+    rdfs:label "pertenece al espacio de la cadena"@es , "belongs to value-chain workspace"@en ;
+    rdfs:comment "Asigna una entidad al contexto de una cadena activa sin convertir la cadena en un nodo del grafo de trabajo."@es ;
+    rdfs:range orca:ValueChain .
 
 orca: a owl:Ontology ;
     rdfs:label "ORCA Graph ontology"@en ;
@@ -15,8 +19,7 @@ orca: a owl:Ontology ;
     rdfs:comment """
         Ontología para la creación colaborativa de ámbitos, componentes
         jerárquicos e indicadores clave de rendimiento.
-    """@es ;
-    owl:imports <http://www.ontology-of-units-of-measure.org/resource/om-2> .
+    """@es .
 
 #################################################################
 # Classes and class restrictions
@@ -141,27 +144,28 @@ orca:KPI a owl:Class ;
         owl:onDataRange xsd:string
     ] ;
 
-    # Every KPI has exactly one definition.
+    # Every KPI has exactly one identification.
     rdfs:subClassOf [
         a owl:Restriction ;
-        owl:onProperty orca:definition ;
+        owl:onProperty orca:identification ;
         owl:qualifiedCardinality "1"^^xsd:nonNegativeInteger ;
         owl:onDataRange xsd:string
     ] ;
 
-    # Every KPI has exactly one unit from OM.
+    # Every KPI has exactly one description.
     rdfs:subClassOf [
         a owl:Restriction ;
-        owl:onProperty orca:unitOfMeasure ;
+        owl:onProperty orca:description ;
         owl:qualifiedCardinality "1"^^xsd:nonNegativeInteger ;
-        owl:onClass om:Unit
+        owl:onDataRange xsd:string
     ] ;
 
-    # A KPI can apply directly to value-chain links.
+    # Every KPI has exactly one evaluation.
     rdfs:subClassOf [
         a owl:Restriction ;
-        owl:onProperty orca:appliesToValueChainLink ;
-        owl:allValuesFrom orca:ValueChainLink
+        owl:onProperty orca:evaluation ;
+        owl:qualifiedCardinality "1"^^xsd:nonNegativeInteger ;
+        owl:onDataRange xsd:string
     ] ;
 
     # A KPI can apply directly to any kind of agent.
@@ -205,22 +209,21 @@ orca:PrincipalAgent a owl:Class ;
     rdfs:label "Principal agent"@en ;
     rdfs:label "Agente principal"@es ;
     rdfs:comment """
-        An agent whose main activity belongs to a value-chain link. KPIs
-        associated with this participation apply to the link itself.
+        An agent whose main activity belongs to one or more value-chain links.
+        KPIs apply directly to the agent.
     """@en ;
     rdfs:comment """
-        Agente cuya actividad principal pertenece a un eslabón de la cadena
-        de valor. Los KPI asociados con esta participación se aplican al propio
-        eslabón.
+        Agente cuya actividad principal pertenece a uno o más eslabones de la
+        cadena de valor. Los KPI se aplican directamente al agente.
     """@es ;
     rdfs:subClassOf [
         a owl:Restriction ;
-        owl:onProperty orca:belongsTo ;
+        owl:onProperty orca:participatesInValueChainLink ;
         owl:someValuesFrom orca:ValueChainLink
     ] ;
     rdfs:subClassOf [
         a owl:Restriction ;
-        owl:onProperty orca:belongsTo ;
+        owl:onProperty orca:participatesInValueChainLink ;
         owl:allValuesFrom orca:ValueChainLink
     ] .
 
@@ -306,6 +309,13 @@ orca:RegionalGovernmentSupportAgent a owl:Class ;
     rdfs:comment "A government support agent operating at regional level."@en ;
     rdfs:comment "Agente de apoyo gubernamental que opera en el nivel regional."@es .
 
+orca:LocalGovernmentSupportAgent a owl:Class ;
+    rdfs:subClassOf orca:GovernmentSupportAgent ;
+    rdfs:label "Local government support agent"@en ;
+    rdfs:label "Agente de apoyo gubernamental local"@es ;
+    rdfs:comment "A government support agent operating at local level."@en ;
+    rdfs:comment "Agente de apoyo gubernamental que opera en el nivel local."@es .
+
 [
     a owl:AllDisjointClasses ;
     owl:members (
@@ -371,7 +381,7 @@ orca:ValueChainLink a owl:Class ;
     ] ;
     rdfs:subClassOf [
         a owl:Restriction ;
-        owl:onProperty orca:precedes ;
+        owl:onProperty orca:isRelated ;
         owl:allValuesFrom orca:ValueChainLink
     ] .
 
@@ -422,21 +432,6 @@ orca:hasSupercomponent a owl:ObjectProperty ;
     rdfs:domain orca:Component ;
     rdfs:range orca:Component ;
     owl:inverseOf orca:hasSubcomponent .
-
-orca:unitOfMeasure a owl:ObjectProperty,
-        owl:FunctionalProperty ;
-    rdfs:label "unit of measure"@en ;
-    rdfs:label "unidad de medida"@es ;
-    rdfs:comment """
-        Relates a KPI to the OM unit in which its value is expressed.
-        The selected resource must be an instance of om:Unit.
-    """@en ;
-    rdfs:comment """
-        Relaciona un KPI con la unidad de OM en la que se expresa su valor.
-        El recurso seleccionado debe ser una instancia de om:Unit.
-    """@es ;
-    rdfs:domain orca:KPI ;
-    rdfs:range om:Unit .
 
 orca:hasValueChainLink a owl:ObjectProperty ;
     rdfs:label "has value-chain link"@en ;
@@ -494,20 +489,13 @@ orca:participatesInValueChainLink a owl:ObjectProperty ;
     rdfs:label "participates in value-chain link"@en ;
     rdfs:label "participa en el eslabón de la cadena de valor"@es ;
     rdfs:comment """
-        Relates an auxiliary or support agent to a value-chain link in which
-        it participates.
+        Relates any agent to a value-chain link in which it participates.
     """@en ;
     rdfs:comment """
-        Relaciona un agente auxiliar o de apoyo con un eslabón de la cadena
-        de valor en el que participa.
+        Relaciona cualquier agente con un eslabón de la cadena de valor en el
+        que participa.
     """@es ;
-    rdfs:domain [
-        a owl:Class ;
-        owl:unionOf (
-            orca:AuxiliaryAgent
-            orca:SupportAgent
-        )
-    ] ;
+    rdfs:domain orca:Agent ;
     rdfs:range orca:ValueChainLink ;
     owl:inverseOf orca:hasParticipatingAgent .
 
@@ -515,36 +503,15 @@ orca:hasParticipatingAgent a owl:ObjectProperty ;
     rdfs:label "has participating agent"@en ;
     rdfs:label "tiene agente participante"@es ;
     rdfs:comment """
-        Relates a value-chain link to an auxiliary or support agent.
+        Relates a value-chain link to any participating agent.
     """@en ;
     rdfs:comment """
-        Relaciona un eslabón de la cadena de valor con un agente auxiliar
-        o de apoyo.
+        Relaciona un eslabón de la cadena de valor con cualquier agente que
+        participa en él.
     """@es ;
     rdfs:domain orca:ValueChainLink ;
-    rdfs:range [
-        a owl:Class ;
-        owl:unionOf (
-            orca:AuxiliaryAgent
-            orca:SupportAgent
-        )
-    ] ;
+    rdfs:range orca:Agent ;
     owl:inverseOf orca:participatesInValueChainLink .
-
-orca:appliesToValueChainLink a owl:ObjectProperty ;
-    rdfs:label "applies to value-chain link"@en ;
-    rdfs:label "se aplica al eslabón de la cadena de valor"@es ;
-    rdfs:comment """
-        Relates a KPI to the value-chain link to which it applies. This
-        relation is used for KPIs associated with principal agents.
-    """@en ;
-    rdfs:comment """
-        Relaciona un KPI con el eslabón de la cadena de valor al que se
-        aplica. Esta relación se utiliza para KPI asociados con agentes
-        principales.
-    """@es ;
-    rdfs:domain orca:KPI ;
-    rdfs:range orca:ValueChainLink .
 
 orca:appliesToAgent a owl:ObjectProperty ;
     rdfs:label "applies to agent"@en ;
@@ -593,17 +560,36 @@ orca:hasKPI a owl:ObjectProperty ;
     rdfs:range orca:KPI ;
     owl:inverseOf orca:appliesToComponent .
 
-orca:precedes a owl:ObjectProperty,
-        owl:IrreflexiveProperty ;
-    rdfs:label "precedes"@en ;
-    rdfs:label "precede a"@es ;
-    rdfs:comment """
-        Indicates that one value-chain link can lead directly to another link.
-    """@en ;
-    rdfs:comment """
-        Indica que un eslabón de la cadena de valor puede conducir directamente
-        a otro eslabón.
-    """@es ;
+orca:isRelated a owl:ObjectProperty,
+        owl:SymmetricProperty ;
+    rdfs:label "is related"@en ;
+    rdfs:label "está relacionado con"@es ;
+    rdfs:comment "Relación general entre dos eslabones de la cadena de valor."@es ;
+    rdfs:domain orca:ValueChainLink ;
+    rdfs:range orca:ValueChainLink .
+
+orca:muevePescadoFresco a owl:ObjectProperty ;
+    rdfs:subPropertyOf orca:isRelated ;
+    rdfs:label "Pescado fresco"@es ;
+    rdfs:domain orca:ValueChainLink ;
+    rdfs:range orca:ValueChainLink .
+
+orca:muevePescadoSeco a owl:ObjectProperty ;
+    rdfs:subPropertyOf orca:isRelated ;
+    rdfs:label "Pescado seco"@es ;
+    rdfs:domain orca:ValueChainLink ;
+    rdfs:range orca:ValueChainLink .
+
+orca:mueveHarinaDePescado a owl:ObjectProperty ;
+    rdfs:subPropertyOf orca:isRelated ;
+    rdfs:label "Harina de pescado"@es ;
+    rdfs:domain orca:ValueChainLink ;
+    rdfs:range orca:ValueChainLink .
+
+orca:financiación a owl:ObjectProperty ;
+    rdfs:subPropertyOf orca:isRelated ;
+    rdfs:label "Transfers funding"@en ;
+    rdfs:label "Financiación"@es ;
     rdfs:domain orca:ValueChainLink ;
     rdfs:range orca:ValueChainLink .
 
@@ -662,18 +648,19 @@ orca:description a owl:DatatypeProperty,
     rdfs:label "description"@en ;
     rdfs:label "descripción"@es ;
     rdfs:comment """
-        A textual description of a scope, component, agent, value chain or
-        value-chain link.
+        A textual description of a scope, component, KPI, agent, value chain
+        or value-chain link.
     """@en ;
     rdfs:comment """
-        Descripción textual de un ámbito, componente, agente, cadena de valor
-        o eslabón.
+        Descripción textual de un ámbito, componente, KPI, agente, cadena de
+        valor o eslabón.
     """@es ;
     rdfs:domain [
         a owl:Class ;
         owl:unionOf (
             orca:Scope
             orca:Component
+            orca:KPI
             orca:Agent
             orca:ValueChain
             orca:ValueChainLink
@@ -681,11 +668,59 @@ orca:description a owl:DatatypeProperty,
     ] ;
     rdfs:range xsd:string .
 
-orca:definition a owl:DatatypeProperty,
+orca:identification a owl:DatatypeProperty,
         owl:FunctionalProperty ;
-    rdfs:label "definition"@en ;
-    rdfs:label "definición"@es ;
-    rdfs:comment "The textual definition of a KPI."@en ;
-    rdfs:comment "Definición textual de un KPI."@es ;
+    rdfs:label "identification"@en ;
+    rdfs:label "identificación"@es ;
+    rdfs:comment "The textual identification of a KPI."@en ;
+    rdfs:comment "Identificación textual de un KPI."@es ;
     rdfs:domain orca:KPI ;
     rdfs:range xsd:string .
+
+orca:evaluation a owl:DatatypeProperty,
+        owl:FunctionalProperty ;
+    rdfs:label "evaluation"@en ;
+    rdfs:label "evaluación"@es ;
+    rdfs:comment "The textual evaluation method or criteria of a KPI."@en ;
+    rdfs:comment "Método o criterios textuales de evaluación de un KPI."@es ;
+    rdfs:domain orca:KPI ;
+    rdfs:range xsd:string .
+
+orca:visibleToUsers a owl:DatatypeProperty,
+        owl:FunctionalProperty ;
+    rdfs:label "visible to users"@en ;
+    rdfs:label "visible para los usuarios"@es ;
+    rdfs:comment "Indicates whether a class is listed for normal users in the Definitions section."@en ;
+    rdfs:comment "Indica si una clase se muestra a los usuarios normales en la sección Definiciones."@es ;
+    rdfs:domain owl:Class ;
+    rdfs:range xsd:boolean .
+
+
+#################################################################
+# Protected core concepts
+#################################################################
+
+orca:coreConcept a owl:DatatypeProperty,
+        owl:FunctionalProperty ;
+    rdfs:label "core concept"@en ;
+    rdfs:label "concepto estructural"@es ;
+    rdfs:comment "Marks ontology classes that are required by the application and cannot be deleted."@en ;
+    rdfs:comment "Marca las clases originales de la ontología que necesita la aplicación y que no se pueden borrar."@es ;
+    rdfs:domain owl:Class ;
+    rdfs:range xsd:boolean .
+
+orca:Scope orca:coreConcept true .
+orca:Component orca:coreConcept true .
+orca:KPI orca:coreConcept true .
+orca:Agent orca:coreConcept true .
+orca:PrincipalAgent orca:coreConcept true .
+orca:AuxiliaryAgent orca:coreConcept true .
+orca:SupportAgent orca:coreConcept true .
+orca:ResearchSupportAgent orca:coreConcept true .
+orca:TrainingSupportAgent orca:coreConcept true .
+orca:GovernmentSupportAgent orca:coreConcept true .
+orca:NationalGovernmentSupportAgent orca:coreConcept true .
+orca:RegionalGovernmentSupportAgent orca:coreConcept true .
+orca:LocalGovernmentSupportAgent orca:coreConcept true .
+orca:ValueChain orca:coreConcept true .
+orca:ValueChainLink orca:coreConcept true .

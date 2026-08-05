@@ -4,21 +4,32 @@ from fastapi import HTTPException
 from app.database import UserModel
 from app.domain import (
     NodeCreate,
+    NodeUpdate,
     NodeType,
+    OntologyConceptCreate,
+    OntologyConceptUpdate,
+    OntologyConceptVisibilityUpdate,
     PasswordChangeCommand,
     RelationCreate,
     RelationType,
+    SupportAgentSubtype,
     UserCreateCommand,
     UserRole,
 )
 from app.main import (
     change_password,
     create_node,
+    create_concept,
+    concepts,
     create_relation,
     create_user_account,
     delete_node,
+    delete_concept,
     delete_relation,
     delete_user_account,
+    update_node,
+    update_concept,
+    update_concept_visibility,
 )
 
 
@@ -46,6 +57,138 @@ def orca_user() -> UserModel:
         password_hash="not-used",
         active=True,
     )
+
+
+def special_user() -> UserModel:
+    user = demo_user()
+    user.role = UserRole.SPECIAL.value
+    return user
+
+
+@pytest.mark.asyncio
+async def test_normal_user_cannot_create_ontology_concept():
+    with pytest.raises(HTTPException) as error:
+        await create_concept(
+            OntologyConceptCreate(label="Nuevo concepto", definition="Una definición."),
+            demo_user(),
+        )
+    assert error.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_special_user_can_update_ontology_concept(monkeypatch):
+    captured = {}
+
+    async def fake_save_concept(label, definition, iri=None):
+        captured.update(label=label, definition=definition, iri=iri)
+        from app.domain import OntologyConcept
+        return OntologyConcept(iri=iri, label=label, definition=definition)
+
+    async def fake_publish(_payload):
+        return None
+
+    monkeypatch.setattr("app.main.graphdb.save_concept", fake_save_concept)
+    monkeypatch.setattr("app.main.hub.publish", fake_publish)
+    result = await update_concept(
+        "https://orca-graph.example/ontology/ValueChain",
+        OntologyConceptUpdate(label="Cadena de valor", definition="Secuencia de eslabones."),
+        special_user(),
+    )
+    assert captured["iri"].endswith("ValueChain")
+    assert result.label == "Cadena de valor"
+
+
+@pytest.mark.asyncio
+async def test_orca_account_can_create_concept_even_if_legacy_role_is_wrong(monkeypatch):
+    legacy_orca = orca_user()
+    legacy_orca.role = UserRole.NORMAL.value
+
+    async def fake_save_concept(label, definition, iri=None):
+        from app.domain import OntologyConcept
+        return OntologyConcept(iri="https://orca-graph.example/ontology/Nuevo", label=label, definition=definition)
+
+    async def fake_publish(_payload):
+        return None
+
+    monkeypatch.setattr("app.main.graphdb.save_concept", fake_save_concept)
+    monkeypatch.setattr("app.main.hub.publish", fake_publish)
+    result = await create_concept(
+        OntologyConceptCreate(label="Nuevo", definition="Nueva definición."),
+        legacy_orca,
+    )
+    assert result.label == "Nuevo"
+
+
+@pytest.mark.asyncio
+async def test_normal_users_request_only_visible_concepts(monkeypatch):
+    captured = {}
+
+    async def fake_concepts(include_hidden=False):
+        captured["include_hidden"] = include_hidden
+        return []
+
+    monkeypatch.setattr("app.main.graphdb.concepts", fake_concepts)
+    await concepts(demo_user())
+    assert captured["include_hidden"] is False
+    await concepts(special_user())
+    assert captured["include_hidden"] is True
+
+
+@pytest.mark.asyncio
+async def test_only_admin_can_change_concept_visibility(monkeypatch):
+    command = OntologyConceptVisibilityUpdate(visible=False)
+    with pytest.raises(HTTPException) as error:
+        await update_concept_visibility("https://orca-graph.example/ontology/ValueChain", command, special_user())
+    assert error.value.status_code == 403
+
+    async def fake_visibility(iri, visible):
+        from app.domain import OntologyConcept
+        return OntologyConcept(iri=iri, label="Cadena de valor", definition="Definición", visible=visible)
+
+    async def fake_publish(_payload):
+        return None
+
+    monkeypatch.setattr("app.main.graphdb.set_concept_visibility", fake_visibility)
+    monkeypatch.setattr("app.main.hub.publish", fake_publish)
+    result = await update_concept_visibility(
+        "https://orca-graph.example/ontology/ValueChain", command, orca_user()
+    )
+    assert result.visible is False
+
+
+@pytest.mark.asyncio
+async def test_special_user_can_delete_any_ontology_concept(monkeypatch):
+    captured = {}
+
+    async def fake_delete(iri):
+        captured["iri"] = iri
+
+    async def fake_publish(_payload):
+        return None
+
+    monkeypatch.setattr("app.main.graphdb.delete_concept", fake_delete)
+    monkeypatch.setattr("app.main.hub.publish", fake_publish)
+    await delete_concept("https://orca-graph.example/ontology/Example", special_user())
+    assert captured["iri"].endswith("Example")
+
+
+@pytest.mark.asyncio
+async def test_normal_user_cannot_delete_ontology_concept():
+    with pytest.raises(HTTPException) as error:
+        await delete_concept("https://orca-graph.example/ontology/Example", demo_user())
+    assert error.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_original_ontology_concept_cannot_be_deleted(monkeypatch):
+    async def fake_delete(_iri):
+        raise PermissionError("Los conceptos originales de la ontología no se pueden borrar; solo editar")
+
+    monkeypatch.setattr("app.main.graphdb.delete_concept", fake_delete)
+    with pytest.raises(HTTPException) as error:
+        await delete_concept("https://orca-graph.example/ontology/KPI", special_user())
+    assert error.value.status_code == 409
+    assert "no se pueden borrar" in error.value.detail
 
 
 @pytest.mark.asyncio
@@ -98,33 +241,20 @@ async def test_invalid_cross_type_similarity_is_rejected(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_kpi_can_apply_to_link_and_agent_simultaneously(monkeypatch):
-    captured = {}
+async def test_kpi_cannot_apply_to_value_chain_link(monkeypatch):
 
     async def fake_node(node_id):
         if node_id == "kpi":
             return "personal", NodeType.KPI
         return "global", NodeType.VALUE_CHAIN_LINK
 
-    async def fake_create_relation(**kwargs):
-        captured.update(kwargs)
-
-    async def fake_publish(_payload):
-        return None
-
     monkeypatch.setattr("app.main.graphdb.node", fake_node)
-    monkeypatch.setattr("app.main.graphdb.create_relation", fake_create_relation)
-    monkeypatch.setattr("app.main.hub.publish", fake_publish)
-    result = await create_relation(
-        RelationCreate(
-            source_id="kpi",
-            target_id="link",
-            relation=RelationType.APPLIES_TO_VALUE_CHAIN_LINK,
-        ),
-        demo_user(),
-    )
-    assert captured["relation"] == RelationType.APPLIES_TO_VALUE_CHAIN_LINK
-    assert result["type"] == RelationType.APPLIES_TO_VALUE_CHAIN_LINK.value
+    with pytest.raises(HTTPException) as error:
+        await create_relation(
+            RelationCreate(source_id="kpi", target_id="link", relation=RelationType.APPLIES_TO_AGENT),
+            demo_user(),
+        )
+    assert error.value.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -134,6 +264,65 @@ async def test_normal_user_cannot_create_value_chain():
             NodeCreate(
                 type=NodeType.VALUE_CHAIN,
                 name="Private chain",
+            ),
+            demo_user(),
+        )
+
+    assert error.value.status_code == 403
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "agent_type",
+    [NodeType.PRINCIPAL_AGENT, NodeType.AUXILIARY_AGENT, NodeType.SUPPORT_AGENT],
+)
+async def test_normal_user_cannot_create_any_agent(agent_type):
+    relation = (
+        RelationType.BELONGS_TO
+        if agent_type == NodeType.PRINCIPAL_AGENT
+        else RelationType.PARTICIPATES_IN_VALUE_CHAIN_LINK
+    )
+    with pytest.raises(HTTPException) as error:
+        await create_node(
+            NodeCreate(
+                type=agent_type,
+                name="Restricted agent",
+                description="Must be created by a privileged account.",
+                parent={"parent_id": "link", "relation": relation},
+            ),
+            demo_user(),
+        )
+
+    assert error.value.status_code == 403
+    assert error.value.detail == "Solo los usuarios especiales o administradores pueden crear agentes"
+
+
+@pytest.mark.asyncio
+async def test_normal_user_cannot_edit_auxiliary_agent(monkeypatch):
+    async def fake_node(_node_id):
+        return demo_user().graph_uri, NodeType.AUXILIARY_AGENT
+
+    monkeypatch.setattr("app.main.graphdb.node", fake_node)
+    with pytest.raises(HTTPException) as error:
+        await update_node(
+            "auxiliary-agent",
+            NodeUpdate(name="Updated auxiliary agent", description="Restricted update"),
+            demo_user(),
+        )
+
+    assert error.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_normal_user_cannot_create_local_government_agent():
+    with pytest.raises(HTTPException) as error:
+        await create_node(
+            NodeCreate(
+                type=NodeType.SUPPORT_AGENT,
+                name="Local authority",
+                description="A local public administration.",
+                support_agent_subtype=SupportAgentSubtype.LOCAL_GOVERNMENT,
+                parent={"parent_id": "link", "relation": "participatesInValueChainLink"},
             ),
             demo_user(),
         )
@@ -346,7 +535,7 @@ async def test_editor_cannot_change_value_chain_topology(monkeypatch):
             RelationCreate(
                 source_id="link-a",
                 target_id="link-b",
-                relation=RelationType.PRECEDES,
+                relation=RelationType.MOVES_FRESH_FISH,
             ),
             demo_user(),
         )

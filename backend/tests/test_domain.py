@@ -52,11 +52,8 @@ def test_kpi_target_rules():
         NodeType.KPI,
         RelationType.HAS_KPI,
     )
-    validate_relation(
-        NodeType.KPI,
-        NodeType.VALUE_CHAIN_LINK,
-        RelationType.APPLIES_TO_VALUE_CHAIN_LINK,
-    )
+    with pytest.raises(ValueError):
+        validate_relation(NodeType.KPI, NodeType.VALUE_CHAIN_LINK, RelationType.APPLIES_TO_AGENT)
     validate_relation(
         NodeType.KPI,
         NodeType.SUPPORT_AGENT,
@@ -74,24 +71,30 @@ def test_kpi_target_rules():
     )
 
 
-def test_value_chain_links_can_be_ordered():
-    validate_relation(
-        NodeType.VALUE_CHAIN_LINK,
-        NodeType.VALUE_CHAIN_LINK,
-        RelationType.PRECEDES,
-    )
+def test_value_chain_links_support_typed_relations():
+    for relation in (
+        RelationType.MOVES_FRESH_FISH,
+        RelationType.MOVES_DRY_FISH,
+        RelationType.MOVES_FISHMEAL,
+        RelationType.TRANSFERS_FUNDING,
+    ):
+        validate_relation(NodeType.VALUE_CHAIN_LINK, NodeType.VALUE_CHAIN_LINK, relation)
 
 
-def test_kpi_requires_definition_and_om_unit_but_can_add_relations_after_creation():
+def test_kpi_requires_identification_description_and_evaluation_but_no_unit():
     with pytest.raises(ValidationError):
         NodeCreate(type=NodeType.KPI, name="Incomplete KPI")
     command = NodeCreate(
         type=NodeType.KPI,
         name="Recycling rate",
-        definition="Share of recycled waste.",
-        unit_iri=f"{OM}percent",
+        identification="KPI-01",
+        description="Share of recycled waste.",
+        evaluation="Percentage of recycled waste over total waste.",
     )
-    assert command.unit_iri == f"{OM}percent"
+    assert command.identification == "KPI-01"
+    assert command.description == "Share of recycled waste."
+    assert command.evaluation == "Percentage of recycled waste over total waste."
+    assert not hasattr(command, "unit_iri")
 
 
 def test_scope_requires_name_and_description():

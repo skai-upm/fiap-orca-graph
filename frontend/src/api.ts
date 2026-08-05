@@ -14,7 +14,8 @@ export type SupportAgentSubtype =
   | "TrainingSupportAgent"
   | "GovernmentSupportAgent"
   | "NationalGovernmentSupportAgent"
-  | "RegionalGovernmentSupportAgent";
+  | "RegionalGovernmentSupportAgent"
+  | "LocalGovernmentSupportAgent";
 
 export type RelationType =
   | "hasComponent"
@@ -28,12 +29,15 @@ export type RelationType =
   | "hasPrincipalAgent"
   | "participatesInValueChainLink"
   | "hasParticipatingAgent"
-  | "appliesToValueChainLink"
   | "appliesToAgent"
   | "appliesToComponent"
   | "hasKPI"
   | "hasAssociatedKPI"
-  | "precedes";
+  | "isRelated"
+  | "muevePescadoFresco"
+  | "muevePescadoSeco"
+  | "mueveHarinaDePescado"
+  | "financiación";
 
 export interface User {
   id: string;
@@ -46,10 +50,12 @@ export interface User {
 
 export type UserRole = "admin" | "special" | "normal";
 
-export interface UnitOption {
+export interface OntologyConcept {
   iri: string;
   label: string;
-  symbol: string;
+  definition: string;
+  visible: boolean;
+  deletable: boolean;
 }
 
 export interface GraphNode {
@@ -57,15 +63,15 @@ export interface GraphNode {
   type: NodeType;
   name: string;
   description: string;
-  definition: string | null;
-  unit_iri: string | null;
-  unit_label: string | null;
+  identification: string | null;
+  evaluation: string | null;
   support_agent_subtype: SupportAgentSubtype | null;
   graph: string;
   owner_id: string | null;
   owner_name: string;
   owner_initials: string;
   editable: boolean;
+  chain_id: string | null;
 }
 
 export interface GraphRelation {
@@ -88,10 +94,11 @@ export interface NodePayload {
   type: NodeType;
   name: string;
   description: string;
-  definition?: string;
-  unit_iri?: string;
+  identification?: string;
+  evaluation?: string;
   support_agent_subtype?: SupportAgentSubtype;
   parent?: { parent_id: string; relation: RelationType };
+  chain_id?: string;
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -131,7 +138,23 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body)
     }),
-  units: () => request<UnitOption[]>("/api/units"),
+  concepts: () => request<OntologyConcept[]>("/api/concepts"),
+  createConcept: (body: { label: string; definition: string }) =>
+    request<OntologyConcept>("/api/concepts", { method: "POST", body: JSON.stringify(body) }),
+  updateConcept: (iri: string, body: { label: string; definition: string }) =>
+    request<OntologyConcept>(`/api/concepts?concept_iri=${encodeURIComponent(iri)}`, {
+      method: "PUT",
+      body: JSON.stringify(body)
+    }),
+  updateConceptVisibility: (iri: string, visible: boolean) =>
+    request<OntologyConcept>(`/api/concepts/visibility?concept_iri=${encodeURIComponent(iri)}`, {
+      method: "PUT",
+      body: JSON.stringify({ visible })
+    }),
+  deleteConcept: (iri: string) =>
+    request<void>(`/api/concepts?concept_iri=${encodeURIComponent(iri)}`, {
+      method: "DELETE"
+    }),
   graph: () => request<Snapshot>("/api/graph"),
   createNode: (body: NodePayload) =>
     request<GraphNode>("/api/nodes", { method: "POST", body: JSON.stringify(body) }),

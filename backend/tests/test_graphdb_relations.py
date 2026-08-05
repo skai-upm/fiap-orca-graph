@@ -37,7 +37,8 @@ async def test_kpi_created_for_component_uses_kpi_to_component_direction(monkeyp
         node_type=NodeType.KPI,
         name="KPI",
         description="",
-        definition="Definition",
+        identification="KPI-01",
+        evaluation="Evaluation",
         unit_iri=f"{OM}percent",
         parent_id="https://example.org/component",
         relation=RelationType.APPLIES_TO_COMPONENT,
@@ -71,7 +72,8 @@ async def test_support_agent_is_typed_as_base_class_and_selected_subclass(monkey
         node_type=NodeType.SUPPORT_AGENT,
         name="Research centre",
         description="",
-        definition=None,
+        identification=None,
+        evaluation=None,
         unit_iri=None,
         parent_id="https://example.org/link",
         relation=RelationType.PARTICIPATES_IN_VALUE_CHAIN_LINK,
@@ -81,6 +83,35 @@ async def test_support_agent_is_typed_as_base_class_and_selected_subclass(monkey
     assert (
         "a <https://orca-graph.example/ontology/SupportAgent>, "
         "<https://orca-graph.example/ontology/ResearchSupportAgent>"
+    ) in captured["sparql"]
+
+
+@pytest.mark.asyncio
+async def test_new_node_persists_active_value_chain_workspace(monkeypatch):
+    captured = {}
+
+    async def fake_update(sparql):
+        captured["sparql"] = sparql
+
+    client = GraphDB()
+    monkeypatch.setattr(client, "update", fake_update)
+    await client.create_node(
+        graph_uri="https://example.org/graph",
+        node_id="https://example.org/component",
+        node_type=NodeType.COMPONENT,
+        name="Component",
+        description="Description",
+        identification=None,
+        evaluation=None,
+        unit_iri=None,
+        parent_id=None,
+        relation=None,
+        chain_id="https://example.org/value-chain",
+    )
+
+    assert (
+        "<https://orca-graph.example/ontology/inValueChain> "
+        "<https://example.org/value-chain>"
     ) in captured["sparql"]
 
 

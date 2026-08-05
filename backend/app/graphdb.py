@@ -1,7 +1,10 @@
 import asyncio
+import re
+import unicodedata
 
 import httpx
-from rdflib import Graph
+from rdflib import Graph, Literal, URIRef
+from rdflib.namespace import OWL, RDF, RDFS, XSD
 
 from .config import settings
 from .domain import (
@@ -16,6 +19,7 @@ from .domain import (
     RelationType,
     SupportAgentSubtype,
     UnitOption,
+    OntologyConcept,
     UserPublic,
 )
 
@@ -31,6 +35,9 @@ def sparql_string(value: str) -> str:
 
 
 class GraphDB:
+    def __init__(self) -> None:
+        self._ontology_lock = asyncio.Lock()
+
     async def ensure_repository(self, attempts: int = 40) -> None:
         endpoint = f"{settings.graphdb_url}/rest/repositories"
         for _ in range(attempts):
@@ -80,6 +87,44 @@ class GraphDB:
                 pass
             await asyncio.sleep(2)
         raise RuntimeError("GraphDB repository is not ready")
+
+    async def migrate_kpi_text_fields(self) -> None:
+        """Move legacy KPI definitions to descriptions and initialise new fields."""
+        await self.update(
+            f"""
+            INSERT {{ GRAPH ?graph {{ ?kpi {sparql_iri(f'{ORCA}description')} ?definition }} }}
+            WHERE {{
+              GRAPH ?graph {{
+                ?kpi a {sparql_iri(f'{ORCA}KPI')} ;
+                     {sparql_iri(f'{ORCA}definition')} ?definition .
+                FILTER NOT EXISTS {{ ?kpi {sparql_iri(f'{ORCA}description')} ?existingDescription }}
+              }}
+            }}
+            """
+        )
+        await self.update(
+            f"""
+            DELETE {{ GRAPH ?graph {{ ?kpi {sparql_iri(f'{ORCA}definition')} ?definition }} }}
+            WHERE {{
+              GRAPH ?graph {{
+                ?kpi a {sparql_iri(f'{ORCA}KPI')} ;
+                     {sparql_iri(f'{ORCA}definition')} ?definition .
+              }}
+            }}
+            """
+        )
+        for property_name in ("identification", "evaluation"):
+            await self.update(
+                f"""
+                INSERT {{ GRAPH ?graph {{ ?kpi {sparql_iri(f'{ORCA}{property_name}')} "" }} }}
+                WHERE {{
+                  GRAPH ?graph {{ ?kpi a {sparql_iri(f'{ORCA}KPI')} }}
+                  FILTER NOT EXISTS {{
+                    GRAPH ?graph {{ ?kpi {sparql_iri(f'{ORCA}{property_name}')} ?value }}
+                  }}
+                }}
+                """
+            )
 
     async def query(self, sparql: str) -> dict:
         async with httpx.AsyncClient(timeout=20) as client:
@@ -136,6 +181,152 @@ class GraphDB:
         return unit_iri.rsplit("/", 1)[-1]
 
     @staticmethod
+    def _spanish_literal(graph: Graph, subject: URIRef, predicate: URIRef) -> str:
+        values = list(graph.objects(subject, predicate))
+        preferred = next((value for value in values if isinstance(value, Literal) and value.language == "es"), None)
+        fallback = next((value for value in values if isinstance(value, Literal) and not value.language), None)
+        return str(preferred or fallback or (values[0] if values else ""))
+
+    def _read_ontology(self) -> Graph:
+        ontology = Graph()
+        ontology.parse(settings.ontology_path, format="turtle")
+        return ontology
+
+    async def concepts(self, include_hidden: bool = False) -> list[OntologyConcept]:
+        ontology = self._read_ontology()
+        concepts = []
+        for subject in ontology.subjects(RDF.type, OWL.Class):
+            if not isinstance(subject, URIRef):
+                continue
+            visibility = next(ontology.objects(subject, URIRef(f"{ORCA}visibleToUsers")), None)
+            visible = visibility is None or bool(visibility.toPython())
+            core = next(ontology.objects(subject, URIRef(f"{ORCA}coreConcept")), None)
+            if not include_hidden and not visible:
+                continue
+            concepts.append(OntologyConcept(
+                iri=str(subject),
+                label=self._spanish_literal(ontology, subject, RDFS.label) or str(subject).rsplit("/", 1)[-1],
+                definition=self._spanish_literal(ontology, subject, RDFS.comment),
+                visible=visible,
+                deletable=not (core is not None and bool(core.toPython())),
+            ))
+        return sorted(concepts, key=lambda item: item.label.casefold())
+
+    @staticmethod
+    def _concept_local_name(label: str) -> str:
+        normalized = unicodedata.normalize("NFKD", label)
+        ascii_label = "".join(character for character in normalized if not unicodedata.combining(character))
+        words = re.findall(r"[A-Za-z0-9]+", ascii_label)
+        local_name = "".join(word[:1].upper() + word[1:] for word in words)
+        if not local_name:
+            raise ValueError("No se puede generar una IRI a partir de la etiqueta")
+        if local_name[0].isdigit():
+            local_name = f"Concept{local_name}"
+        return local_name
+
+    async def save_concept(self, label: str, definition: str, concept_iri: str | None = None) -> OntologyConcept:
+        async with self._ontology_lock:
+            ontology = self._read_ontology()
+            classes = {subject for subject in ontology.subjects(RDF.type, OWL.Class) if isinstance(subject, URIRef)}
+            if concept_iri is None:
+                existing_labels = {
+                    str(value).casefold()
+                    for subject in classes
+                    for value in ontology.objects(subject, RDFS.label)
+                }
+                if label.casefold() in existing_labels:
+                    raise ValueError("Ya existe un concepto con esa etiqueta")
+                local_name = self._concept_local_name(label)
+                subject = URIRef(f"{ORCA}{local_name}")
+                suffix = 2
+                while subject in classes:
+                    subject = URIRef(f"{ORCA}{local_name}{suffix}")
+                    suffix += 1
+                ontology.add((subject, RDF.type, OWL.Class))
+            else:
+                subject = URIRef(concept_iri)
+                if subject not in classes:
+                    raise LookupError("Concepto ontológico no encontrado")
+            for predicate in (RDFS.label, RDFS.comment):
+                for value in list(ontology.objects(subject, predicate)):
+                    if isinstance(value, Literal) and value.language == "es":
+                        ontology.remove((subject, predicate, value))
+            ontology.add((subject, RDFS.label, Literal(label, lang="es")))
+            ontology.add((subject, RDFS.comment, Literal(definition, lang="es")))
+            serialized = ontology.serialize(format="turtle")
+            temporary_path = settings.ontology_path.with_suffix(".ttl.tmp")
+            temporary_path.write_text(serialized, encoding="utf-8")
+            async with httpx.AsyncClient(timeout=20) as client:
+                response = await client.put(
+                    settings.statements_url,
+                    params={"context": f"<{ORCA}ontology>"},
+                    content=serialized,
+                    headers={"Content-Type": "text/turtle"},
+                )
+                response.raise_for_status()
+            temporary_path.replace(settings.ontology_path)
+            visibility = next(ontology.objects(subject, URIRef(f"{ORCA}visibleToUsers")), None)
+            visible = visibility is None or bool(visibility.toPython())
+            core = next(ontology.objects(subject, URIRef(f"{ORCA}coreConcept")), None)
+            return OntologyConcept(
+                iri=str(subject), label=label, definition=definition, visible=visible,
+                deletable=not (core is not None and bool(core.toPython())),
+            )
+
+    async def set_concept_visibility(self, concept_iri: str, visible: bool) -> OntologyConcept:
+        async with self._ontology_lock:
+            ontology = self._read_ontology()
+            subject = URIRef(concept_iri)
+            if (subject, RDF.type, OWL.Class) not in ontology:
+                raise LookupError("Concepto ontológico no encontrado")
+            predicate = URIRef(f"{ORCA}visibleToUsers")
+            ontology.remove((subject, predicate, None))
+            ontology.add((subject, predicate, Literal(visible, datatype=XSD.boolean)))
+            serialized = ontology.serialize(format="turtle")
+            temporary_path = settings.ontology_path.with_suffix(".ttl.tmp")
+            temporary_path.write_text(serialized, encoding="utf-8")
+            async with httpx.AsyncClient(timeout=20) as client:
+                response = await client.put(
+                    settings.statements_url,
+                    params={"context": f"<{ORCA}ontology>"},
+                    content=serialized,
+                    headers={"Content-Type": "text/turtle"},
+                )
+                response.raise_for_status()
+            temporary_path.replace(settings.ontology_path)
+            return OntologyConcept(
+                iri=concept_iri,
+                label=self._spanish_literal(ontology, subject, RDFS.label) or concept_iri.rsplit("/", 1)[-1],
+                definition=self._spanish_literal(ontology, subject, RDFS.comment),
+                visible=visible,
+                deletable=not bool(next(ontology.objects(subject, URIRef(f"{ORCA}coreConcept")), Literal(False)).toPython()),
+            )
+
+    async def delete_concept(self, concept_iri: str) -> None:
+        async with self._ontology_lock:
+            ontology = self._read_ontology()
+            subject = URIRef(concept_iri)
+            if (subject, RDF.type, OWL.Class) not in ontology:
+                raise LookupError("Concepto ontológico no encontrado")
+            core = next(ontology.objects(subject, URIRef(f"{ORCA}coreConcept")), None)
+            if core is not None and bool(core.toPython()):
+                raise PermissionError("Los conceptos originales de la ontología no se pueden borrar; solo editar")
+            ontology.remove((subject, None, None))
+            ontology.remove((None, None, subject))
+            serialized = ontology.serialize(format="turtle")
+            temporary_path = settings.ontology_path.with_suffix(".ttl.tmp")
+            temporary_path.write_text(serialized, encoding="utf-8")
+            async with httpx.AsyncClient(timeout=20) as client:
+                response = await client.put(
+                    settings.statements_url,
+                    params={"context": f"<{ORCA}ontology>"},
+                    content=serialized,
+                    headers={"Content-Type": "text/turtle"},
+                )
+                response.raise_for_status()
+            temporary_path.replace(settings.ontology_path)
+
+    @staticmethod
     def node_type_iris() -> str:
         return ", ".join(sparql_iri(f"{ORCA}{item.value}") for item in NodeType)
 
@@ -162,7 +353,6 @@ class GraphDB:
             SELECT DISTINCT ?predicate WHERE {{
               GRAPH ?graph {{ {sparql_iri(node_id)} ?predicate ?target . }}
               FILTER(?predicate IN (
-                {sparql_iri(RelationType.APPLIES_TO_VALUE_CHAIN_LINK.iri)},
                 {sparql_iri(RelationType.APPLIES_TO_AGENT.iri)},
                 {sparql_iri(RelationType.APPLIES_TO_COMPONENT.iri)}
               ))
@@ -181,24 +371,34 @@ class GraphDB:
         node_type: NodeType,
         name: str,
         description: str,
-        definition: str | None,
+        identification: str | None,
+        evaluation: str | None,
         unit_iri: str | None,
         parent_id: str | None,
         relation: RelationType | None,
         support_agent_subtype: SupportAgentSubtype | None = None,
+        chain_id: str | None = None,
     ) -> None:
         properties = [f"{sparql_iri(f'{ORCA}name')} {sparql_string(name)}"]
         if description:
             properties.append(
                 f"{sparql_iri(f'{ORCA}description')} {sparql_string(description)}"
             )
-        if definition:
+        if identification:
             properties.append(
-                f"{sparql_iri(f'{ORCA}definition')} {sparql_string(definition)}"
+                f"{sparql_iri(f'{ORCA}identification')} {sparql_string(identification)}"
+            )
+        if evaluation:
+            properties.append(
+                f"{sparql_iri(f'{ORCA}evaluation')} {sparql_string(evaluation)}"
             )
         if unit_iri:
             properties.append(
                 f"{sparql_iri(f'{ORCA}unitOfMeasure')} {sparql_iri(unit_iri)}"
+            )
+        if chain_id:
+            properties.append(
+                f"{sparql_iri(f'{ORCA}inValueChain')} {sparql_iri(chain_id)}"
             )
         rdf_types = [sparql_iri(f"{ORCA}{node_type.value}")]
         if (
@@ -280,12 +480,14 @@ class GraphDB:
         node_type: NodeType,
         name: str,
         description: str,
-        definition: str | None,
+        identification: str | None,
+        evaluation: str | None,
         unit_iri: str | None,
         support_agent_subtype: SupportAgentSubtype | None,
     ) -> None:
         editable_properties = [
             f"{ORCA}name", f"{ORCA}description", f"{ORCA}definition",
+            f"{ORCA}identification", f"{ORCA}evaluation",
             f"{ORCA}hasApplicationLevel", f"{ORCA}applicationScope",
             f"{ORCA}unitOfMeasure",
         ]
@@ -320,8 +522,10 @@ class GraphDB:
         properties = [f"{sparql_iri(f'{ORCA}name')} {sparql_string(name)}"]
         if description:
             properties.append(f"{sparql_iri(f'{ORCA}description')} {sparql_string(description)}")
-        if definition:
-            properties.append(f"{sparql_iri(f'{ORCA}definition')} {sparql_string(definition)}")
+        if identification:
+            properties.append(f"{sparql_iri(f'{ORCA}identification')} {sparql_string(identification)}")
+        if evaluation:
+            properties.append(f"{sparql_iri(f'{ORCA}evaluation')} {sparql_string(evaluation)}")
         if unit_iri:
             properties.append(f"{sparql_iri(f'{ORCA}unitOfMeasure')} {sparql_iri(unit_iri)}")
         triples = [f"{sparql_iri(node_id)} " + " ; ".join(properties) + " ."]
@@ -446,15 +650,16 @@ class GraphDB:
         user_by_graph = {user.graph_uri: user for user in users}
         node_result = await self.query(
             f"""
-            SELECT ?graph ?id ?type ?name ?description ?definition
-                   ?unit ?supportAgentSubtype
+            SELECT ?graph ?id ?type ?name ?description ?identification ?evaluation
+                   ?supportAgentSubtype ?chain
             WHERE {{
               GRAPH ?graph {{
                 ?id a ?type ; {sparql_iri(f"{ORCA}name")} ?name .
                 FILTER(?type IN ({self.node_type_iris()}))
                 OPTIONAL {{ ?id {sparql_iri(f"{ORCA}description")} ?description }}
-                OPTIONAL {{ ?id {sparql_iri(f"{ORCA}definition")} ?definition }}
-                OPTIONAL {{ ?id {sparql_iri(f"{ORCA}unitOfMeasure")} ?unit }}
+                OPTIONAL {{ ?id {sparql_iri(f"{ORCA}identification")} ?identification }}
+                OPTIONAL {{ ?id {sparql_iri(f"{ORCA}evaluation")} ?evaluation }}
+                OPTIONAL {{ ?id {sparql_iri(f"{ORCA}inValueChain")} ?chain }}
                 OPTIONAL {{
                   ?id a ?supportAgentSubtype .
                   FILTER(?supportAgentSubtype IN ({
@@ -469,10 +674,6 @@ class GraphDB:
             }} ORDER BY ?name
             """
         )
-        unit_labels = {
-            unit.iri: f"{unit.label} ({unit.symbol})" if unit.symbol else unit.label
-            for unit in await self.units()
-        }
         nodes: list[Node] = []
         seen_ids: set[str] = set()
         for row in node_result["results"]["bindings"]:
@@ -482,19 +683,14 @@ class GraphDB:
             seen_ids.add(node_id)
             graph_uri = row["graph"]["value"]
             owner = user_by_graph.get(graph_uri)
-            unit_iri = row.get("unit", {}).get("value")
             nodes.append(
                 Node(
                     id=node_id,
                     type=NodeType(row["type"]["value"].removeprefix(ORCA)),
                     name=row["name"]["value"],
                     description=row.get("description", {}).get("value", ""),
-                    definition=row.get("definition", {}).get("value"),
-                    unit_iri=unit_iri,
-                    unit_label=unit_labels.get(
-                        unit_iri,
-                        unit_iri.rsplit("/", 1)[-1] if unit_iri else None,
-                    ),
+                    identification=row.get("identification", {}).get("value"),
+                    evaluation=row.get("evaluation", {}).get("value"),
                     support_agent_subtype=(
                         SupportAgentSubtype(
                             row["supportAgentSubtype"]["value"].removeprefix(ORCA)
@@ -511,6 +707,7 @@ class GraphDB:
                     owner_name=owner.display_name if owner else "ORCA Graph",
                     owner_initials=owner.initials if owner else "OG",
                     editable=owner is not None and owner.id == current_user_id,
+                    chain_id=row.get("chain", {}).get("value"),
                 )
             )
         node_ids = {node.id for node in nodes}
@@ -521,11 +718,14 @@ class GraphDB:
             RelationType.HAS_VALUE_CHAIN_LINK,
             RelationType.BELONGS_TO,
             RelationType.PARTICIPATES_IN_VALUE_CHAIN_LINK,
-            RelationType.APPLIES_TO_VALUE_CHAIN_LINK,
             RelationType.APPLIES_TO_AGENT,
             RelationType.HAS_KPI,
             RelationType.HAS_ASSOCIATED_KPI,
-            RelationType.PRECEDES,
+            RelationType.IS_RELATED,
+            RelationType.MOVES_FRESH_FISH,
+            RelationType.MOVES_DRY_FISH,
+            RelationType.MOVES_FISHMEAL,
+            RelationType.TRANSFERS_FUNDING,
         }
         relation_iris = ", ".join(
             sparql_iri(item.iri) for item in visible_relation_types
@@ -607,7 +807,7 @@ class GraphDB:
                 <{ORCA}description> "Primary extraction and production." ;
                 <{ORCA}isValueChainLinkOf>
                 <https://orca-graph.example/resource/value-chain-circular-pilot> ;
-                <{ORCA}precedes>
+                <{ORCA}muevePescadoFresco>
                 <https://orca-graph.example/resource/link-marketer> .
               <https://orca-graph.example/resource/link-marketer>
                 a <{ORCA}ValueChainLink> ;
@@ -641,9 +841,7 @@ class GraphDB:
                 <{ORCA}unitOfMeasure>
                 <http://www.ontology-of-units-of-measure.org/resource/om-2/kilowattHour> ;
                 <{ORCA}appliesToComponent>
-                <https://orca-graph.example/resource/component-energy> ;
-                <{ORCA}appliesToValueChainLink>
-                <https://orca-graph.example/resource/link-primary-sector> .
+                <https://orca-graph.example/resource/component-energy> .
             """,
             "user-maria": f"""
               <https://orca-graph.example/resource/agent-logistics> a <{ORCA}AuxiliaryAgent> ;
@@ -682,13 +880,10 @@ class GraphDB:
                 headers={"Content-Type": "text/turtle"},
             )
             response.raise_for_status()
-            om_response = await client.put(
-                settings.statements_url,
-                params={"context": f"<{settings.om_graph_uri}>"},
-                content=settings.om_ontology_path.read_bytes(),
-                headers={"Content-Type": "application/rdf+xml"},
-            )
-            om_response.raise_for_status()
+        # Remove unit assertions left by installations created before v7.22.0.
+        await self.update(
+            f"DELETE WHERE {{ GRAPH ?graph {{ ?kpi {sparql_iri(f'{ORCA}unitOfMeasure')} ?unit }} }}"
+        )
         # Remove KPI properties retired in v7.10.0 from all user graphs.
         await self.update(
             f"""
@@ -710,6 +905,17 @@ class GraphDB:
         # upgrade; all current seed entities live in a real user's named graph.
         await self.update(
             f"CLEAR SILENT GRAPH {sparql_iri(settings.global_graph_uri)}"
+        )
+        # Migrate the relations retired in v7.21.0. KPI-to-link assertions are
+        # removed; legacy ordering is preserved as the new general relation.
+        await self.update(
+            f"""
+            DELETE {{ GRAPH ?graph {{ ?kpi {sparql_iri(f'{ORCA}appliesToValueChainLink')} ?link }} }}
+            WHERE  {{ GRAPH ?graph {{ ?kpi {sparql_iri(f'{ORCA}appliesToValueChainLink')} ?link }} }} ;
+            DELETE {{ GRAPH ?graph {{ ?left {sparql_iri(f'{ORCA}precedes')} ?right }} }}
+            INSERT {{ GRAPH ?graph {{ ?left {sparql_iri(RelationType.IS_RELATED.iri)} ?right }} }}
+            WHERE  {{ GRAPH ?graph {{ ?left {sparql_iri(f'{ORCA}precedes')} ?right }} }}
+            """
         )
         await self.seed_user_examples(users)
 

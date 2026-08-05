@@ -114,7 +114,13 @@ async def initialize_database() -> None:
             marker is None or marker.value != BOOTSTRAP_USERS_VERSION
         )
         for item in BOOTSTRAP_USERS:
-            existing = await session.get(UserModel, item["id"])
+            with session.no_autoflush:
+                result = await session.execute(
+                    select(UserModel).where(UserModel.username == item["username"])
+                )
+                existing = result.scalar_one_or_none()
+                if existing is None:
+                    existing = await session.get(UserModel, item["id"])
             if existing is None:
                 session.add(
                     UserModel(
@@ -128,12 +134,9 @@ async def initialize_database() -> None:
                     )
                 )
             elif must_apply_bootstrap:
-                existing.username = item["username"]
                 existing.display_name = item["display_name"]
                 existing.initials = item["initials"]
                 existing.role = item["role"]
-                existing.graph_uri = f"{settings.personal_graph_prefix}{item['id']}"
-                existing.password_hash = password_hasher.hash(item["password"])
                 existing.active = True
         if must_apply_bootstrap:
             if marker is None:

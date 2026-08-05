@@ -31,6 +31,7 @@ class SupportAgentSubtype(StrEnum):
     GOVERNMENT = "GovernmentSupportAgent"
     NATIONAL_GOVERNMENT = "NationalGovernmentSupportAgent"
     REGIONAL_GOVERNMENT = "RegionalGovernmentSupportAgent"
+    LOCAL_GOVERNMENT = "LocalGovernmentSupportAgent"
 
     @property
     def iri(self) -> str:
@@ -49,12 +50,15 @@ class RelationType(StrEnum):
     HAS_PRINCIPAL_AGENT = "hasPrincipalAgent"
     PARTICIPATES_IN_VALUE_CHAIN_LINK = "participatesInValueChainLink"
     HAS_PARTICIPATING_AGENT = "hasParticipatingAgent"
-    APPLIES_TO_VALUE_CHAIN_LINK = "appliesToValueChainLink"
     APPLIES_TO_AGENT = "appliesToAgent"
     APPLIES_TO_COMPONENT = "appliesToComponent"
     HAS_KPI = "hasKPI"
     HAS_ASSOCIATED_KPI = "hasAssociatedKPI"
-    PRECEDES = "precedes"
+    IS_RELATED = "isRelated"
+    MOVES_FRESH_FISH = "muevePescadoFresco"
+    MOVES_DRY_FISH = "muevePescadoSeco"
+    MOVES_FISHMEAL = "mueveHarinaDePescado"
+    TRANSFERS_FUNDING = "financiación"
 
     @property
     def iri(self) -> str:
@@ -81,7 +85,6 @@ INVERSE_RELATIONS: dict[RelationType, RelationType] = {
 NEW_NODE_SOURCE_RELATIONS = {
     RelationType.BELONGS_TO,
     RelationType.PARTICIPATES_IN_VALUE_CHAIN_LINK,
-    RelationType.APPLIES_TO_VALUE_CHAIN_LINK,
     RelationType.APPLIES_TO_AGENT,
     RelationType.APPLIES_TO_COMPONENT,
 }
@@ -104,10 +107,12 @@ ALLOWED_RELATIONS: dict[tuple[NodeType, NodeType], set[RelationType]] = {
         RelationType.IS_VALUE_CHAIN_LINK_OF
     },
     (NodeType.PRINCIPAL_AGENT, NodeType.VALUE_CHAIN_LINK): {
-        RelationType.BELONGS_TO
+        RelationType.BELONGS_TO,
+        RelationType.PARTICIPATES_IN_VALUE_CHAIN_LINK,
     },
     (NodeType.VALUE_CHAIN_LINK, NodeType.PRINCIPAL_AGENT): {
-        RelationType.HAS_PRINCIPAL_AGENT
+        RelationType.HAS_PRINCIPAL_AGENT,
+        RelationType.HAS_PARTICIPATING_AGENT,
     },
     (NodeType.AUXILIARY_AGENT, NodeType.VALUE_CHAIN_LINK): {
         RelationType.PARTICIPATES_IN_VALUE_CHAIN_LINK
@@ -122,10 +127,11 @@ ALLOWED_RELATIONS: dict[tuple[NodeType, NodeType], set[RelationType]] = {
         RelationType.HAS_PARTICIPATING_AGENT
     },
     (NodeType.VALUE_CHAIN_LINK, NodeType.VALUE_CHAIN_LINK): {
-        RelationType.PRECEDES
-    },
-    (NodeType.KPI, NodeType.VALUE_CHAIN_LINK): {
-        RelationType.APPLIES_TO_VALUE_CHAIN_LINK
+        RelationType.IS_RELATED,
+        RelationType.MOVES_FRESH_FISH,
+        RelationType.MOVES_DRY_FISH,
+        RelationType.MOVES_FISHMEAL,
+        RelationType.TRANSFERS_FUNDING,
     },
     (NodeType.KPI, NodeType.AUXILIARY_AGENT): {
         RelationType.APPLIES_TO_AGENT
@@ -157,10 +163,11 @@ class NodeCreate(BaseModel):
     type: NodeType
     name: str = Field(min_length=1, max_length=200)
     description: str = Field(default="", max_length=2000)
-    definition: str | None = Field(default=None, max_length=2000)
-    unit_iri: str | None = Field(default=None, max_length=500)
+    identification: str | None = Field(default=None, max_length=2000)
+    evaluation: str | None = Field(default=None, max_length=2000)
     support_agent_subtype: SupportAgentSubtype | None = None
     parent: ParentLink | None = None
+    chain_id: str | None = None
 
     @model_validator(mode="after")
     def validate_required_fields(self) -> "NodeCreate":
@@ -171,13 +178,12 @@ class NodeCreate(BaseModel):
         if self.type in {NodeType.SCOPE, NodeType.COMPONENT} and not self.description:
             raise ValueError(f"A {self.type.value.lower()} requires a description")
         if self.type == NodeType.KPI:
-            self.definition = (self.definition or "").strip()
-            if not self.definition:
-                raise ValueError("A KPI requires a definition")
-            if not self.unit_iri:
-                raise ValueError("A KPI requires an OM unit")
-            if not self.unit_iri.startswith(OM):
-                raise ValueError("The KPI unit must be an OM 2 resource")
+            self.identification = (self.identification or "").strip()
+            self.evaluation = (self.evaluation or "").strip()
+            if not self.identification or not self.description or not self.evaluation:
+                raise ValueError("A KPI requires identification, description and evaluation")
+        elif self.identification is not None or self.evaluation is not None:
+            raise ValueError("Only a KPI can have identification and evaluation")
         if self.type == NodeType.SUPPORT_AGENT:
             self.support_agent_subtype = (
                 self.support_agent_subtype or SupportAgentSubtype.GENERAL
@@ -197,8 +203,8 @@ class NodeCreate(BaseModel):
 class NodeUpdate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     description: str = Field(default="", max_length=2000)
-    definition: str | None = Field(default=None, max_length=2000)
-    unit_iri: str | None = Field(default=None, max_length=500)
+    identification: str | None = Field(default=None, max_length=2000)
+    evaluation: str | None = Field(default=None, max_length=2000)
     support_agent_subtype: SupportAgentSubtype | None = None
 
 
@@ -219,15 +225,15 @@ class Node(BaseModel):
     type: NodeType
     name: str
     description: str = ""
-    definition: str | None = None
-    unit_iri: str | None = None
-    unit_label: str | None = None
+    identification: str | None = None
+    evaluation: str | None = None
     support_agent_subtype: SupportAgentSubtype | None = None
     graph: str
     owner_id: str | None = None
     owner_name: str = "ORCA Graph"
     owner_initials: str = "OG"
     editable: bool = False
+    chain_id: str | None = None
 
 
 class Relation(BaseModel):
@@ -250,6 +256,35 @@ class UnitOption(BaseModel):
     iri: str
     label: str
     symbol: str
+
+
+class OntologyConcept(BaseModel):
+    iri: str
+    label: str
+    definition: str
+    visible: bool = True
+    deletable: bool = False
+
+
+class OntologyConceptCreate(BaseModel):
+    label: str = Field(min_length=1, max_length=200)
+    definition: str = Field(min_length=1, max_length=4000)
+
+    @model_validator(mode="after")
+    def trim_values(self) -> "OntologyConceptCreate":
+        self.label = self.label.strip()
+        self.definition = self.definition.strip()
+        if not self.label or not self.definition:
+            raise ValueError("Label and definition are required")
+        return self
+
+
+class OntologyConceptUpdate(OntologyConceptCreate):
+    pass
+
+
+class OntologyConceptVisibilityUpdate(BaseModel):
+    visible: bool
 
 
 class UserPublic(BaseModel):

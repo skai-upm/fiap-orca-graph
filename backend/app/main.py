@@ -27,10 +27,14 @@ from .domain import (
     NodeCreate,
     NodeUpdate,
     NodeType,
+    OntologyConcept,
+    OntologyConceptCreate,
+    OntologyConceptUpdate,
+    OntologyConceptVisibilityUpdate,
     PasswordChangeCommand,
     RelationCreate,
     RelationType,
-    UnitOption,
+    SupportAgentSubtype,
     UserCreateCommand,
     UserPublic,
     UserRole,
@@ -46,10 +50,11 @@ async def lifespan(_: FastAPI):
     await graphdb.ensure_repository()
     await graphdb.wait_until_ready()
     await graphdb.seed(await list_users())
+    await graphdb.migrate_kpi_text_fields()
     yield
 
 
-app = FastAPI(title="ORCA Graph API", version="7.11.0", lifespan=lifespan)
+app = FastAPI(title="ORCA Graph API", version="7.32.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
@@ -168,9 +173,72 @@ async def delete_user_account(user_id: str, user: CurrentUser) -> None:
     )
 
 
-@app.get("/api/units", response_model=list[UnitOption])
-async def units(_user: CurrentUser) -> list[UnitOption]:
-    return await graphdb.units()
+@app.get("/api/concepts", response_model=list[OntologyConcept])
+async def concepts(user: CurrentUser) -> list[OntologyConcept]:
+    return await graphdb.concepts(include_hidden=user.role in {UserRole.ADMIN.value, UserRole.SPECIAL.value})
+
+
+def require_ontology_editor(user: CurrentUser) -> None:
+    if user.username != "orca" and user.role not in {UserRole.ADMIN.value, UserRole.SPECIAL.value}:
+        raise HTTPException(
+            status_code=403,
+            detail="Solo los usuarios especiales o administradores pueden modificar definiciones",
+        )
+
+
+@app.post("/api/concepts", response_model=OntologyConcept, status_code=status.HTTP_201_CREATED)
+async def create_concept(command: OntologyConceptCreate, user: CurrentUser) -> OntologyConcept:
+    require_ontology_editor(user)
+    try:
+        concept = await graphdb.save_concept(command.label, command.definition)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    await hub.publish({"type": "ontology.changed", "action": "concept.created", "actor": user.public().model_dump(), "concept": concept.model_dump()})
+    return concept
+
+
+@app.put("/api/concepts/visibility", response_model=OntologyConcept)
+async def update_concept_visibility(
+    concept_iri: str,
+    command: OntologyConceptVisibilityUpdate,
+    user: CurrentUser,
+) -> OntologyConcept:
+    if user.username != "orca" and user.role != UserRole.ADMIN.value:
+        raise HTTPException(status_code=403, detail="Solo los administradores pueden cambiar la visibilidad")
+    try:
+        concept = await graphdb.set_concept_visibility(concept_iri, command.visible)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    await hub.publish({"type": "ontology.changed", "action": "concept.visibility", "actor": user.public().model_dump(), "concept": concept.model_dump()})
+    return concept
+
+
+@app.put("/api/concepts", response_model=OntologyConcept)
+async def update_concept(concept_iri: str, command: OntologyConceptUpdate, user: CurrentUser) -> OntologyConcept:
+    require_ontology_editor(user)
+    try:
+        concept = await graphdb.save_concept(command.label, command.definition, concept_iri)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    await hub.publish({"type": "ontology.changed", "action": "concept.updated", "actor": user.public().model_dump(), "concept": concept.model_dump()})
+    return concept
+
+
+@app.delete("/api/concepts", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_concept(concept_iri: str, user: CurrentUser) -> None:
+    require_ontology_editor(user)
+    try:
+        await graphdb.delete_concept(concept_iri)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    await hub.publish({
+        "type": "ontology.changed",
+        "action": "concept.deleted",
+        "actor": user.public().model_dump(),
+        "concept_iri": concept_iri,
+    })
 
 
 @app.get("/api/model")
@@ -195,6 +263,29 @@ async def graph(user: CurrentUser) -> GraphSnapshot:
 
 @app.post("/api/nodes", response_model=Node, status_code=status.HTTP_201_CREATED)
 async def create_node(command: NodeCreate, user: CurrentUser) -> Node:
+    privileged_roles = {UserRole.ADMIN.value, UserRole.SPECIAL.value}
+    agent_types = {
+        NodeType.PRINCIPAL_AGENT,
+        NodeType.AUXILIARY_AGENT,
+        NodeType.SUPPORT_AGENT,
+    }
+    if command.type in agent_types and user.role not in privileged_roles:
+        raise HTTPException(
+            status_code=403,
+            detail="Solo los usuarios especiales o administradores pueden crear agentes",
+        )
+    if (
+        command.support_agent_subtype == SupportAgentSubtype.LOCAL_GOVERNMENT
+        and user.role not in privileged_roles
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Solo los usuarios especiales o administradores pueden crear agentes gubernamentales locales",
+        )
+    if command.type != NodeType.VALUE_CHAIN and command.chain_id:
+        active_chain = await graphdb.node(command.chain_id)
+        if active_chain is None or active_chain[1] != NodeType.VALUE_CHAIN:
+            raise HTTPException(status_code=422, detail="La cadena activa no es válida")
     if (
         command.type in {NodeType.VALUE_CHAIN, NodeType.VALUE_CHAIN_LINK}
         and user.role not in {UserRole.ADMIN.value, UserRole.SPECIAL.value}
@@ -225,26 +316,28 @@ async def create_node(command: NodeCreate, user: CurrentUser) -> Node:
         node_type=command.type,
         name=command.name.strip(),
         description=command.description.strip(),
-        definition=command.definition,
-        unit_iri=command.unit_iri,
+        identification=command.identification,
+        evaluation=command.evaluation,
+        unit_iri=None,
         support_agent_subtype=command.support_agent_subtype,
         parent_id=parent_id,
         relation=relation,
+        chain_id=command.chain_id,
     )
     node = Node(
         id=node_id,
         type=command.type,
         name=command.name.strip(),
         description=command.description.strip(),
-        definition=command.definition,
-        unit_iri=command.unit_iri,
-        unit_label=await graphdb.unit_label(command.unit_iri),
+        identification=command.identification,
+        evaluation=command.evaluation,
         support_agent_subtype=command.support_agent_subtype,
         graph=user.graph_uri,
         owner_id=user.id,
         owner_name=user.display_name,
         owner_initials=user.initials,
         editable=True,
+        chain_id=command.chain_id,
     )
     await hub.publish(
         {
@@ -265,17 +358,31 @@ async def update_node(node_id: str, command: NodeUpdate, user: CurrentUser) -> N
     graph_uri, node_type = existing
     if graph_uri != user.graph_uri:
         raise HTTPException(status_code=403, detail="Solo puedes editar entidades creadas por ti")
+    privileged_roles = {UserRole.ADMIN.value, UserRole.SPECIAL.value}
+    if node_type == NodeType.AUXILIARY_AGENT and user.role not in privileged_roles:
+        raise HTTPException(
+            status_code=403,
+            detail="Solo los usuarios especiales o administradores pueden editar agentes auxiliares",
+        )
+    if (
+        command.support_agent_subtype == SupportAgentSubtype.LOCAL_GOVERNMENT
+        and user.role not in privileged_roles
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Solo los usuarios especiales o administradores pueden crear o editar agentes gubernamentales locales",
+        )
     try:
         validated = NodeCreate(
             type=node_type,
             name=command.name,
             description=command.description,
-            definition=command.definition,
-            unit_iri=command.unit_iri,
+            identification=command.identification,
+            evaluation=command.evaluation,
             support_agent_subtype=command.support_agent_subtype,
             parent={"parent_id": node_id, "relation": "similarTo"}
             if node_type in {NodeType.KPI}
-            else {"parent_id": node_id, "relation": "belongsTo"}
+            else {"parent_id": node_id, "relation": "participatesInValueChainLink"}
             if node_type in {NodeType.PRINCIPAL_AGENT}
             else {"parent_id": node_id, "relation": "participatesInValueChainLink"}
             if node_type in {NodeType.AUXILIARY_AGENT, NodeType.SUPPORT_AGENT, NodeType.VALUE_CHAIN_LINK}
@@ -289,8 +396,9 @@ async def update_node(node_id: str, command: NodeUpdate, user: CurrentUser) -> N
         node_type=node_type,
         name=validated.name,
         description=validated.description,
-        definition=validated.definition,
-        unit_iri=validated.unit_iri,
+        identification=validated.identification,
+        evaluation=validated.evaluation,
+        unit_iri=None,
         support_agent_subtype=validated.support_agent_subtype,
     )
     snapshot = await graphdb.snapshot(await list_users(include_inactive=True), user.id)
@@ -305,6 +413,14 @@ async def create_relation(command: RelationCreate, user: CurrentUser) -> dict:
     target = await graphdb.node(command.target_id)
     if source is None or target is None:
         raise HTTPException(status_code=404, detail="No se encuentra el origen o destino")
+    if (
+        NodeType.AUXILIARY_AGENT in {source[1], target[1]}
+        and user.role not in {UserRole.ADMIN.value, UserRole.SPECIAL.value}
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Solo los usuarios especiales o administradores pueden editar agentes auxiliares",
+        )
     try:
         validate_relation(source[1], target[1], command.relation)
     except ValueError as exc:
@@ -312,7 +428,11 @@ async def create_relation(command: RelationCreate, user: CurrentUser) -> dict:
     if command.relation in {
         RelationType.HAS_VALUE_CHAIN_LINK,
         RelationType.IS_VALUE_CHAIN_LINK_OF,
-        RelationType.PRECEDES,
+        RelationType.IS_RELATED,
+        RelationType.MOVES_FRESH_FISH,
+        RelationType.MOVES_DRY_FISH,
+        RelationType.MOVES_FISHMEAL,
+        RelationType.TRANSFERS_FUNDING,
     } and user.role not in {UserRole.ADMIN.value, UserRole.SPECIAL.value}:
         raise HTTPException(
             status_code=403,
@@ -361,6 +481,25 @@ async def create_relation(command: RelationCreate, user: CurrentUser) -> dict:
 
 @app.delete("/api/relations", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_relation(command: RelationCreate, user: CurrentUser) -> None:
+    agent_relations = {
+        RelationType.PARTICIPATES_IN_VALUE_CHAIN_LINK,
+        RelationType.HAS_PARTICIPATING_AGENT,
+        RelationType.APPLIES_TO_AGENT,
+        RelationType.HAS_ASSOCIATED_KPI,
+    }
+    if command.relation in agent_relations:
+        source = await graphdb.node(command.source_id)
+        target = await graphdb.node(command.target_id)
+        if (
+            source is not None
+            and target is not None
+            and NodeType.AUXILIARY_AGENT in {source[1], target[1]}
+            and user.role not in {UserRole.ADMIN.value, UserRole.SPECIAL.value}
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Solo los usuarios especiales o administradores pueden editar agentes auxiliares",
+            )
     if not await graphdb.relation_exists(
         user.graph_uri,
         command.source_id,
