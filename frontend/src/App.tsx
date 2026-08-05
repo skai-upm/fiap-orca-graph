@@ -1,6 +1,7 @@
 import cytoscape, { Core } from "cytoscape";
 import {
   CircleDot,
+  Copy,
   FilterX,
   GitBranch,
   KeyRound,
@@ -36,7 +37,7 @@ import {
 } from "./api";
 
 const emptySnapshot: Snapshot = { nodes: [], relations: [], current_user_id: "" };
-const APP_VERSION = "7.32.0";
+const APP_VERSION = "7.33.0";
 
 function snapshotForChain(snapshot: Snapshot, chainId: string | null): Snapshot {
   if (!chainId) return { ...snapshot, nodes: [], relations: [] };
@@ -1416,6 +1417,7 @@ function DataWorkspace({
   user,
   onSelect,
   onActivateChain,
+  onCreated,
   onCreateNode,
   onEditNode,
   onDeleteNode
@@ -1426,6 +1428,7 @@ function DataWorkspace({
   user: User;
   onSelect: (id: string) => void;
   onActivateChain: (id: string) => void;
+  onCreated: () => Promise<void>;
   onCreateNode: (type: NodeType) => void;
   onEditNode: (node: GraphNode) => void;
   onDeleteNode: (node: GraphNode) => void;
@@ -1439,6 +1442,10 @@ function DataWorkspace({
   const [conceptLabel, setConceptLabel] = useState("");
   const [conceptDefinition, setConceptDefinition] = useState("");
   const [savingConcept, setSavingConcept] = useState(false);
+  const [duplicatingChain, setDuplicatingChain] = useState<GraphNode | null>(null);
+  const [duplicateName, setDuplicateName] = useState("");
+  const [duplicateError, setDuplicateError] = useState("");
+  const [duplicating, setDuplicating] = useState(false);
   const agents: NodeType[] = ["PrincipalAgent", "AuxiliaryAgent", "SupportAgent"];
   const visibleDataSections = canManageValueChains(user)
     ? dataSections
@@ -1514,6 +1521,33 @@ function DataWorkspace({
       await loadConcepts();
     } catch (error) {
       setConceptError(error instanceof Error ? error.message : "No se pudo borrar el concepto");
+    }
+  }
+
+  function openDuplicateChain(chain: GraphNode) {
+    setDuplicatingChain(chain);
+    setDuplicateName(`${chain.name} (copia)`);
+    setDuplicateError("");
+  }
+
+  async function duplicateChain(event: FormEvent) {
+    event.preventDefault();
+    if (!duplicatingChain) return;
+    const name = duplicateName.trim();
+    if (globalSnapshot.nodes.some((node) => node.type === "ValueChain" && node.name.trim().toLocaleLowerCase("es") === name.toLocaleLowerCase("es"))) {
+      setDuplicateError("Ya existe una cadena de valor con ese nombre.");
+      return;
+    }
+    setDuplicating(true);
+    setDuplicateError("");
+    try {
+      await api.duplicateValueChain(duplicatingChain.id, name);
+      setDuplicatingChain(null);
+      await onCreated();
+    } catch (error) {
+      setDuplicateError(error instanceof Error ? error.message : "No se pudo duplicar la cadena");
+    } finally {
+      setDuplicating(false);
     }
   }
   const namesForIds = (ids: string[]) => [...new Set(ids)]
@@ -1817,6 +1851,9 @@ function DataWorkspace({
                     >
                       {activeChainId === node.id ? "Cadena activa" : "Activar cadena"}
                     </button>
+                    <button className="table-action" onClick={() => openDuplicateChain(node)}>
+                      <Copy /> Duplicar
+                    </button>
                     {node.editable && <>
                       <button className="table-action" onClick={() => onEditNode(node)}><Pencil /> Editar</button>
                       <button className="table-action danger-action" onClick={() => onDeleteNode(node)}><Trash2 /> Borrar</button>
@@ -1937,6 +1974,29 @@ function DataWorkspace({
             {!count && <div className="data-empty">No hay registros que coincidan con los filtros.</div>}
           </div>
         </div>
+        {duplicatingChain && createPortal(
+          <div className="overlay" role="presentation" onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !duplicating) setDuplicatingChain(null);
+          }}>
+            <form className="dialog" onSubmit={duplicateChain} role="dialog" aria-modal="true" aria-labelledby="duplicate-chain-title">
+              <div className="dialog-title">
+                <div>
+                  <strong id="duplicate-chain-title">Duplicar cadena de valor</strong>
+                  <span>Se crearán nuevas instancias RDF para todo el contenido de «{duplicatingChain.name}».</span>
+                </div>
+                <button type="button" className="icon" disabled={duplicating} aria-label="Cerrar" onClick={() => setDuplicatingChain(null)}><X /></button>
+              </div>
+              <label>Nuevo nombre<input autoFocus value={duplicateName} onChange={(event) => setDuplicateName(event.target.value)} maxLength={200} required /></label>
+              <p className="form-help">El nombre debe ser distinto al de cualquier cadena existente.</p>
+              {duplicateError && <div className="toast error">{duplicateError}</div>}
+              <div className="dialog-actions">
+                <button type="button" className="secondary" disabled={duplicating} onClick={() => setDuplicatingChain(null)}>Cancelar</button>
+                <button type="submit" className="primary" disabled={duplicating || !duplicateName.trim()}><Copy /> {duplicating ? "Duplicando…" : "Duplicar cadena"}</button>
+              </div>
+            </form>
+          </div>,
+          document.body
+        )}
         {conceptError && <div className="error concept-error">{conceptError}</div>}
       </div>
       {editingConcept !== undefined && createPortal(
@@ -2301,6 +2361,7 @@ function Workspace({
           user={user}
           onSelect={(id) => { setSelected(id); setView("graph"); }}
           onActivateChain={activateChain}
+          onCreated={load}
           onCreateNode={openCreate}
           onEditNode={openEdit}
           onDeleteNode={removeNode}

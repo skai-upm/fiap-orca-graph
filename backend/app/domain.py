@@ -208,6 +208,17 @@ class NodeUpdate(BaseModel):
     support_agent_subtype: SupportAgentSubtype | None = None
 
 
+class ValueChainDuplicate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+
+    @model_validator(mode="after")
+    def trim_name(self) -> "ValueChainDuplicate":
+        self.name = self.name.strip()
+        if not self.name:
+            raise ValueError("Name is required")
+        return self
+
+
 class RelationCreate(BaseModel):
     source_id: str = Field(min_length=1)
     target_id: str = Field(min_length=1)

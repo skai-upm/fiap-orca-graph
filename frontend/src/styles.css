@@ -473,6 +473,7 @@ footer span { display: flex; align-items: center; gap: 6px; }
 .type-card span { color: #777; font-size: 10px; line-height: 1.35; font-weight: 400; }
 .form-row { display: grid; grid-template-columns: 1.5fr 1fr; gap: 10px; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; padding-top: 15px; border-top: 1px solid var(--line); }
+.form-help{margin:6px 0 0;color:#73848c;font-size:11px;line-height:1.45}
 .multi-field{display:grid;gap:7px;margin-top:14px}
 .multi-tags{display:flex;flex-wrap:wrap;gap:6px}
 .multi-tag{display:inline-flex;align-items:center;gap:7px;padding:5px 8px 5px 10px;border-radius:14px;background:#263b48;color:#fff;font-size:11px}

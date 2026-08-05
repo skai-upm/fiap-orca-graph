@@ -116,6 +116,82 @@ async def test_new_node_persists_active_value_chain_workspace(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_duplicate_value_chain_remaps_every_application_resource(monkeypatch):
+    source_chain = "https://example.org/chain/source"
+    source_component = "https://example.org/component/source"
+    captured = {}
+
+    async def fake_query(_sparql):
+        return {
+            "results": {
+                "bindings": [
+                    {
+                        "subject": {"type": "uri", "value": source_chain},
+                        "predicate": {"type": "uri", "value": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"},
+                        "object": {"type": "uri", "value": "https://orca-graph.example/ontology/ValueChain"},
+                    },
+                    {
+                        "subject": {"type": "uri", "value": source_chain},
+                        "predicate": {"type": "uri", "value": "https://orca-graph.example/ontology/name"},
+                        "object": {"type": "literal", "value": "Original"},
+                    },
+                    {
+                        "subject": {"type": "uri", "value": source_chain},
+                        "predicate": {"type": "uri", "value": "https://orca-graph.example/ontology/hasComponent"},
+                        "object": {"type": "uri", "value": source_component},
+                    },
+                    {
+                        "subject": {"type": "uri", "value": source_component},
+                        "predicate": {"type": "uri", "value": "https://orca-graph.example/ontology/name"},
+                        "object": {"type": "literal", "value": "Componente"},
+                    },
+                    {
+                        "subject": {"type": "uri", "value": source_component},
+                        "predicate": {"type": "uri", "value": "https://orca-graph.example/ontology/inValueChain"},
+                        "object": {"type": "uri", "value": source_chain},
+                    },
+                ]
+            }
+        }
+
+    async def fake_update(sparql):
+        captured["sparql"] = sparql
+
+    client = GraphDB()
+    monkeypatch.setattr(client, "query", fake_query)
+    monkeypatch.setattr(client, "update", fake_update)
+    new_chain = await client.duplicate_value_chain(
+        graph_uri="https://example.org/graph/user",
+        source_chain_id=source_chain,
+        node_ids={source_chain, source_component},
+        new_name="Copia independiente",
+    )
+
+    inserted = captured["sparql"]
+    assert '"Copia independiente"' in inserted
+    assert source_chain not in inserted
+    assert source_component not in inserted
+    assert new_chain in inserted
+    assert inserted.count("https://orca-graph.example/resource/") >= 2
+
+
+@pytest.mark.asyncio
+async def test_value_chain_name_uniqueness_is_case_insensitive(monkeypatch):
+    captured = {}
+
+    async def fake_query(sparql):
+        captured["sparql"] = sparql
+        return {"boolean": True}
+
+    client = GraphDB()
+    monkeypatch.setattr(client, "query", fake_query)
+
+    assert await client.value_chain_name_exists("  Cadena Azul  ") is True
+    assert "LCASE" in captured["sparql"]
+    assert '"Cadena Azul"' in captured["sparql"]
+
+
+@pytest.mark.asyncio
 async def test_node_deletion_cascades_relations_across_named_graphs(monkeypatch):
     updates = []
 

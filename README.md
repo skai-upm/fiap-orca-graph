@@ -1,4 +1,6 @@
-# ORCA Graph v7.32.0
+# ORCA Graph v7.33.0
+
+Version 7.33.0 lets special users and administrators duplicate any existing value chain. The user supplies a new globally unique name and the backend clones the complete chain workspace into the requesting user's named graph. Every application resource receives a new IRI, internal relations are rewired to the new resources, RDF types and literal datatypes are preserved, and legacy resources without explicit `orca:inValueChain` assertions are assigned to the new chain. The source chain remains unchanged.
 
 Version 7.32.0 extends the graph's Scope filter into a semantic path view. Selecting one or more scopes now displays the selected scope nodes, their direct and nested components, the KPI associated with those components, the agents associated with those KPI, and the value-chain links associated with those agents. Relations among the resulting links are preserved. Multiple scopes produce the union of their paths without duplicating graph elements.
 

@@ -1,6 +1,7 @@
 import asyncio
 import re
 import unicodedata
+from uuid import uuid4
 
 import httpx
 from rdflib import Graph, Literal, URIRef
@@ -472,6 +473,94 @@ class GraphDB:
         )
         bindings = result.get("results", {}).get("bindings", [])
         return bindings[0]["chain"]["value"] if bindings else None
+
+    async def value_chain_name_exists(self, name: str) -> bool:
+        result = await self.query(
+            f"""
+            ASK {{
+              GRAPH ?graph {{
+                ?chain a {sparql_iri(f'{ORCA}ValueChain')} ;
+                       {sparql_iri(f'{ORCA}name')} ?name .
+                FILTER(LCASE(STR(?name)) = LCASE({sparql_string(name.strip())}))
+              }}
+            }}
+            """
+        )
+        return bool(result.get("boolean"))
+
+    @staticmethod
+    def _binding_term(binding: dict) -> str:
+        if binding["type"] == "uri":
+            return sparql_iri(binding["value"])
+        if binding["type"] in {"literal", "typed-literal"}:
+            term = sparql_string(binding["value"])
+            language = binding.get("xml:lang")
+            datatype = binding.get("datatype")
+            if language:
+                return f"{term}@{language}"
+            if datatype:
+                return f"{term}^^{sparql_iri(datatype)}"
+            return term
+        raise ValueError("Unsupported RDF term while duplicating a value chain")
+
+    async def duplicate_value_chain(
+        self,
+        graph_uri: str,
+        source_chain_id: str,
+        node_ids: set[str],
+        new_name: str,
+    ) -> str:
+        """Copy a complete value-chain workspace into the requesting user's graph."""
+        if source_chain_id not in node_ids:
+            raise ValueError("The source value chain is not part of its workspace")
+        values = " ".join(sparql_iri(node_id) for node_id in sorted(node_ids))
+        result = await self.query(
+            f"""
+            SELECT ?subject ?predicate ?object WHERE {{
+              VALUES ?subject {{ {values} }}
+              GRAPH ?sourceGraph {{ ?subject ?predicate ?object }}
+            }}
+            """
+        )
+        mapping = {
+            node_id: f"https://orca-graph.example/resource/{uuid4()}"
+            for node_id in node_ids
+        }
+        new_chain_id = mapping[source_chain_id]
+        triples: list[str] = []
+        for row in result.get("results", {}).get("bindings", []):
+            old_subject = row["subject"]["value"]
+            predicate = row["predicate"]["value"]
+            if predicate == f"{ORCA}name" and old_subject == source_chain_id:
+                object_term = sparql_string(new_name)
+            elif predicate == f"{ORCA}inValueChain":
+                object_term = sparql_iri(new_chain_id)
+            else:
+                object_binding = row["object"]
+                object_term = (
+                    sparql_iri(mapping[object_binding["value"]])
+                    if object_binding.get("type") == "uri"
+                    and object_binding["value"] in mapping
+                    else self._binding_term(object_binding)
+                )
+            triples.append(
+                f"{sparql_iri(mapping[old_subject])} "
+                f"{sparql_iri(predicate)} {object_term} ."
+            )
+        # Older workspaces may lack explicit scoping. Make every copied resource
+        # unambiguously part of the new chain without changing its other values.
+        for old_id, new_id in mapping.items():
+            if old_id != source_chain_id:
+                triples.append(
+                    f"{sparql_iri(new_id)} {sparql_iri(f'{ORCA}inValueChain')} "
+                    f"{sparql_iri(new_chain_id)} ."
+                )
+        if not triples:
+            raise LookupError("The value chain has no RDF content to duplicate")
+        await self.update(
+            f"INSERT DATA {{ GRAPH {sparql_iri(graph_uri)} {{ {' '.join(triples)} }} }}"
+        )
+        return new_chain_id
 
     async def update_node(
         self,

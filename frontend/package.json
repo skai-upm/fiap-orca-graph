@@ -1,7 +1,7 @@
 {
   "name": "orca-graph-frontend",
   "private": true,
-  "version": "7.32.0",
+  "version": "7.33.0",
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",

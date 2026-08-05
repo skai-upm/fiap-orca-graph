@@ -38,6 +38,7 @@ from .domain import (
     UserCreateCommand,
     UserPublic,
     UserRole,
+    ValueChainDuplicate,
     validate_relation,
 )
 from .graphdb import graphdb
@@ -54,7 +55,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="ORCA Graph API", version="7.32.0", lifespan=lifespan)
+app = FastAPI(title="ORCA Graph API", version="7.33.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
@@ -347,6 +348,90 @@ async def create_node(command: NodeCreate, user: CurrentUser) -> Node:
             "node": node.model_dump(),
         }
     )
+    return node
+
+
+def _node_ids_for_chain(snapshot: GraphSnapshot, chain_id: str) -> set[str]:
+    chain_ids = {node.id for node in snapshot.nodes if node.type == NodeType.VALUE_CHAIN}
+    explicitly_scoped = {node.id for node in snapshot.nodes if node.chain_id == chain_id}
+    foreign_scoped = {
+        node.id for node in snapshot.nodes
+        if node.chain_id is not None and node.chain_id != chain_id
+    }
+    membership_links: set[str] = set()
+    foreign_links: set[str] = set()
+    for edge in snapshot.relations:
+        if edge.type == RelationType.HAS_VALUE_CHAIN_LINK:
+            if edge.source == chain_id:
+                membership_links.add(edge.target)
+            elif edge.source in chain_ids:
+                foreign_links.add(edge.target)
+        elif edge.type == RelationType.IS_VALUE_CHAIN_LINK_OF:
+            if edge.target == chain_id:
+                membership_links.add(edge.source)
+            elif edge.target in chain_ids:
+                foreign_links.add(edge.source)
+    visible = {chain_id, *explicitly_scoped, *membership_links}
+    changed = True
+    while changed:
+        changed = False
+        for edge in snapshot.relations:
+            candidate = (
+                edge.target if edge.source in visible
+                else edge.source if edge.target in visible
+                else None
+            )
+            if (
+                candidate
+                and candidate not in chain_ids
+                and candidate not in foreign_links
+                and candidate not in foreign_scoped
+                and candidate not in visible
+            ):
+                visible.add(candidate)
+                changed = True
+    return visible
+
+
+@app.post("/api/value-chains/{chain_id:path}/duplicate", response_model=Node)
+async def duplicate_value_chain(
+    chain_id: str,
+    command: ValueChainDuplicate,
+    user: CurrentUser,
+) -> Node:
+    if user.role not in {UserRole.ADMIN.value, UserRole.SPECIAL.value}:
+        raise HTTPException(
+            status_code=403,
+            detail="Solo los usuarios especiales o administradores pueden duplicar cadenas",
+        )
+    source = await graphdb.node(chain_id)
+    if source is None or source[1] != NodeType.VALUE_CHAIN:
+        raise HTTPException(status_code=404, detail="Cadena de valor no encontrada")
+    if await graphdb.value_chain_name_exists(command.name):
+        raise HTTPException(
+            status_code=409,
+            detail="Ya existe una cadena de valor con ese nombre",
+        )
+    snapshot = await graphdb.snapshot(await list_users(include_inactive=True), user.id)
+    node_ids = _node_ids_for_chain(snapshot, chain_id)
+    try:
+        new_chain_id = await graphdb.duplicate_value_chain(
+            graph_uri=user.graph_uri,
+            source_chain_id=chain_id,
+            node_ids=node_ids,
+            new_name=command.name,
+        )
+    except (LookupError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    updated = await graphdb.snapshot(await list_users(include_inactive=True), user.id)
+    node = next(item for item in updated.nodes if item.id == new_chain_id)
+    await hub.publish({
+        "type": "graph.changed",
+        "action": "value_chain.duplicated",
+        "actor": user.public().model_dump(),
+        "source_chain_id": chain_id,
+        "node": node.model_dump(),
+    })
     return node
 
 

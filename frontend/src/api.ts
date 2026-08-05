@@ -158,6 +158,11 @@ export const api = {
   graph: () => request<Snapshot>("/api/graph"),
   createNode: (body: NodePayload) =>
     request<GraphNode>("/api/nodes", { method: "POST", body: JSON.stringify(body) }),
+  duplicateValueChain: (chainId: string, name: string) =>
+    request<GraphNode>(`/api/value-chains/${encodeURIComponent(chainId)}/duplicate`, {
+      method: "POST",
+      body: JSON.stringify({ name })
+    }),
   updateNode: (nodeId: string, body: Omit<NodePayload, "type" | "parent">) =>
     request<GraphNode>(`/api/nodes?node_id=${encodeURIComponent(nodeId)}`, {
       method: "PUT",
