@@ -25,6 +25,28 @@ orca: a owl:Ontology ;
 # Classes and class restrictions
 #################################################################
 
+orca:User a owl:Class ;
+    orca:coreConcept true ;
+    rdfs:label "User"@en , "Usuario"@es ;
+    rdfs:comment "A platform user who may belong to one or more teams."@en ,
+        "Usuario de la plataforma que puede pertenecer a uno o varios equipos."@es .
+
+orca:Team a owl:Class ;
+    orca:coreConcept true ;
+    rdfs:label "Team"@en , "Equipo"@es ;
+    rdfs:comment "A uniquely named group of platform users."@en ,
+        "Grupo de usuarios de la plataforma con un nombre único."@es ;
+    rdfs:subClassOf [
+        a owl:Restriction ;
+        owl:onProperty orca:name ;
+        owl:qualifiedCardinality "1"^^xsd:nonNegativeInteger ;
+        owl:onDataRange xsd:string
+    ] , [
+        a owl:Restriction ;
+        owl:onProperty orca:hasMember ;
+        owl:allValuesFrom orca:User
+    ] .
+
 orca:Scope a owl:Class ;
     rdfs:label "Scope"@en ;
     rdfs:label "Ámbito"@es ;
@@ -74,15 +96,12 @@ orca:Component a owl:Class ;
     rdfs:label "Component"@en ;
     rdfs:label "Componente"@es ;
     rdfs:comment """
-        A thematic component grouped by a scope. Components can be arranged
-        hierarchically: a subcomponent is another instance of orca:Component.
-        KPIs relate to components rather than directly to scopes.
+        A thematic component grouped by a scope. A component can contain
+        multiple subcomponents and can have associated KPIs.
     """@en ;
     rdfs:comment """
-        Componente temático agrupado por un ámbito. Los componentes pueden
-        organizarse jerárquicamente: un subcomponente es otra instancia de
-        orca:Component. Los KPI se relacionan con componentes y no directamente
-        con ámbitos.
+        Componente temático agrupado por un ámbito. Un componente puede contener
+        múltiples subcomponentes y tener KPI asociados.
     """@es ;
 
     # Every component has exactly one name.
@@ -101,18 +120,11 @@ orca:Component a owl:Class ;
         owl:onDataRange xsd:string
     ] ;
 
-    # All subcomponent values must be components.
+    # All subcomponent values must be subcomponents.
     rdfs:subClassOf [
         a owl:Restriction ;
         owl:onProperty orca:hasSubcomponent ;
-        owl:allValuesFrom orca:Component
-    ] ;
-
-    # All supercomponent values must be components.
-    rdfs:subClassOf [
-        a owl:Restriction ;
-        owl:onProperty orca:hasSupercomponent ;
-        owl:allValuesFrom orca:Component
+        owl:allValuesFrom orca:Subcomponent
     ] ;
 
     # A component can only contain KPIs.
@@ -123,6 +135,21 @@ orca:Component a owl:Class ;
     ] ;
 
     owl:disjointWith orca:KPI .
+
+orca:Subcomponent a owl:Class ;
+    rdfs:subClassOf orca:Component ;
+    rdfs:label "Subcomponent"@en ;
+    rdfs:label "Subcomponente"@es ;
+    rdfs:comment "A component level that can belong to multiple components and contain multiple elements."@en ;
+    rdfs:comment "Nivel que puede pertenecer a múltiples componentes y contener múltiples elementos."@es ;
+    rdfs:subClassOf [ a owl:Restriction ; owl:onProperty orca:hasElement ; owl:allValuesFrom orca:Element ] .
+
+orca:Element a owl:Class ;
+    rdfs:subClassOf orca:Subcomponent ;
+    rdfs:label "Element"@en ;
+    rdfs:label "Elemento"@es ;
+    rdfs:comment "The most specific component level; it can belong to multiple subcomponents and have associated KPIs."@en ;
+    rdfs:comment "Nivel más específico; puede pertenecer a múltiples subcomponentes y tener KPI asociados."@es .
 
 orca:KPI a owl:Class ;
     rdfs:label "Key performance indicator"@en ;
@@ -144,10 +171,10 @@ orca:KPI a owl:Class ;
         owl:onDataRange xsd:string
     ] ;
 
-    # Every KPI has exactly one identification.
+    # Every KPI has exactly one code.
     rdfs:subClassOf [
         a owl:Restriction ;
-        owl:onProperty orca:identification ;
+        owl:onProperty orca:code ;
         owl:qualifiedCardinality "1"^^xsd:nonNegativeInteger ;
         owl:onDataRange xsd:string
     ] ;
@@ -421,17 +448,31 @@ orca:hasSubcomponent a owl:ObjectProperty ;
     rdfs:comment "Relates a component to one of its direct subcomponents."@en ;
     rdfs:comment "Relaciona un componente con uno de sus subcomponentes directos."@es ;
     rdfs:domain orca:Component ;
-    rdfs:range orca:Component ;
-    owl:inverseOf orca:hasSupercomponent .
+    rdfs:range orca:Subcomponent ;
+    owl:inverseOf orca:isSubcomponentOf .
 
-orca:hasSupercomponent a owl:ObjectProperty ;
-    rdfs:label "has supercomponent"@en ;
-    rdfs:label "tiene supercomponente"@es ;
-    rdfs:comment "Relates a component to one of its direct parent components."@en ;
-    rdfs:comment "Relaciona un componente con uno de sus componentes superiores directos."@es ;
-    rdfs:domain orca:Component ;
+orca:isSubcomponentOf a owl:ObjectProperty ;
+    rdfs:label "is subcomponent of"@en ;
+    rdfs:label "es subcomponente de"@es ;
+    rdfs:comment "Relates a subcomponent to one of the components that contains it."@en ;
+    rdfs:comment "Relaciona un subcomponente con uno de los componentes que lo contiene."@es ;
+    rdfs:domain orca:Subcomponent ;
     rdfs:range orca:Component ;
     owl:inverseOf orca:hasSubcomponent .
+
+orca:hasElement a owl:ObjectProperty ;
+    rdfs:label "has element"@en ;
+    rdfs:label "tiene elemento"@es ;
+    rdfs:domain orca:Subcomponent ;
+    rdfs:range orca:Element ;
+    owl:inverseOf orca:isElementOf .
+
+orca:isElementOf a owl:ObjectProperty ;
+    rdfs:label "is element of"@en ;
+    rdfs:label "es elemento de"@es ;
+    rdfs:domain orca:Element ;
+    rdfs:range orca:Subcomponent ;
+    owl:inverseOf orca:hasElement .
 
 orca:hasValueChainLink a owl:ObjectProperty ;
     rdfs:label "has value-chain link"@en ;
@@ -569,25 +610,21 @@ orca:isRelated a owl:ObjectProperty,
     rdfs:range orca:ValueChainLink .
 
 orca:muevePescadoFresco a owl:ObjectProperty ;
-    rdfs:subPropertyOf orca:isRelated ;
     rdfs:label "Pescado fresco"@es ;
     rdfs:domain orca:ValueChainLink ;
     rdfs:range orca:ValueChainLink .
 
 orca:muevePescadoSeco a owl:ObjectProperty ;
-    rdfs:subPropertyOf orca:isRelated ;
     rdfs:label "Pescado seco"@es ;
     rdfs:domain orca:ValueChainLink ;
     rdfs:range orca:ValueChainLink .
 
 orca:mueveHarinaDePescado a owl:ObjectProperty ;
-    rdfs:subPropertyOf orca:isRelated ;
     rdfs:label "Harina de pescado"@es ;
     rdfs:domain orca:ValueChainLink ;
     rdfs:range orca:ValueChainLink .
 
 orca:financiación a owl:ObjectProperty ;
-    rdfs:subPropertyOf orca:isRelated ;
     rdfs:label "Transfers funding"@en ;
     rdfs:label "Financiación"@es ;
     rdfs:domain orca:ValueChainLink ;
@@ -624,6 +661,18 @@ orca:similarTo a owl:ObjectProperty,
 # Datatype properties
 #################################################################
 
+orca:hasMember a owl:ObjectProperty ;
+    rdfs:label "has member"@en , "tiene miembro"@es ;
+    rdfs:domain orca:Team ;
+    rdfs:range orca:User ;
+    owl:inverseOf orca:memberOf .
+
+orca:memberOf a owl:ObjectProperty ;
+    rdfs:label "member of"@en , "miembro de"@es ;
+    rdfs:domain orca:User ;
+    rdfs:range orca:Team ;
+    owl:inverseOf orca:hasMember .
+
 orca:name a owl:DatatypeProperty,
         owl:FunctionalProperty ;
     rdfs:label "name"@en ;
@@ -639,6 +688,7 @@ orca:name a owl:DatatypeProperty,
             orca:Agent
             orca:ValueChain
             orca:ValueChainLink
+            orca:Team
         )
     ] ;
     rdfs:range xsd:string .
@@ -668,12 +718,12 @@ orca:description a owl:DatatypeProperty,
     ] ;
     rdfs:range xsd:string .
 
-orca:identification a owl:DatatypeProperty,
+orca:code a owl:DatatypeProperty,
         owl:FunctionalProperty ;
-    rdfs:label "identification"@en ;
-    rdfs:label "identificación"@es ;
-    rdfs:comment "The textual identification of a KPI."@en ;
-    rdfs:comment "Identificación textual de un KPI."@es ;
+    rdfs:label "code"@en ;
+    rdfs:label "código"@es ;
+    rdfs:comment "The editable textual code of a KPI."@en ;
+    rdfs:comment "Código textual editable de un KPI."@es ;
     rdfs:domain orca:KPI ;
     rdfs:range xsd:string .
 
@@ -711,6 +761,8 @@ orca:coreConcept a owl:DatatypeProperty,
 
 orca:Scope orca:coreConcept true .
 orca:Component orca:coreConcept true .
+orca:Subcomponent orca:coreConcept true .
+orca:Element orca:coreConcept true .
 orca:KPI orca:coreConcept true .
 orca:Agent orca:coreConcept true .
 orca:PrincipalAgent orca:coreConcept true .

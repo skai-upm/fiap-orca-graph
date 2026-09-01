@@ -1,4 +1,99 @@
-# ORCA Graph v7.33.0
+# ORCA Graph v8.11.0
+
+Version 8.11.0 makes the graph Inspector independently collapsible and
+restorable, allowing the canvas to use the released width. A single node click
+now selects it without changing graph visibility, while a double click reveals
+its direct neighbours; repeated double clicks on newly revealed nodes expand
+the graph recursively. The selected-node Inspector also offers a contextual
+Show/Hide neighbours action that respects the manual graph visibility state.
+
+Version 8.10.0 widens and enlarges the graph category browser, adds live
+name search across its node checklists and aligns every category marker with
+the corresponding Cytoscape node shape and colour. The Inspector relation
+section is now collapsible and uses full-width relationship rows with a fixed
+delete-action column, preventing narrow wrapped cards. Both graph side panels
+have additional room while the existing sidebar collapse control is retained.
+
+Version 8.9.0 turns the graph legend into an interactive category browser.
+Each node type expands into a named checklist with per-node and whole-category
+visibility controls. The dedicated Scope filter has been removed; user, node
+type and neighbourhood filters remain available. Clicking a graph node now
+adds its direct neighbours recursively, while explicitly hidden nodes remain
+hidden. The login screen and application footer link to the public GitHub
+repository at `https://github.com/skai-upm/fiap-orca-graph`.
+
+Version 8.8.0 replaces the browser-native view selector with a custom ORCA
+Graph dropdown. The trigger shows the active view with its corporate icon and
+the expanded panel presents every view as a descriptive card, highlights the
+current selection and closes after selection or an outside click. The compact
+desktop header and responsive hamburger navigation are preserved.
+
+Version 8.7.0 replaces the three desktop view tabs with a compact dropdown in
+the header while retaining the responsive hamburger navigation. Value-chain
+link relations now persist exactly the relation selected in the form. The
+specific fish and funding predicates are no longer declared as subproperties
+of `orca:isRelated`, preventing GraphDB from inferring an additional generic
+“is related” edge for every explicit link relation.
+
+Version 8.6.0 replaces the former recursive Component hierarchy with three
+explicit levels: Component, Subcomponent and Element. Subcomponent is an
+`rdfs:subClassOf` Component and Element is an `rdfs:subClassOf` Subcomponent;
+all inherit the same required name and description datatype properties.
+Component–Subcomponent and Subcomponent–Element associations are N:N and store
+their explicit inverses. Only Components can be selected from Scope, while KPI
+can be associated with any of the three levels. The Data menu, forms, tables,
+graph, Scope traversal, permissions and Excel export include both new levels.
+Startup migration converts the earlier component hierarchy while preserving
+resource IRIs, literals, ownership, chain context and KPI links.
+
+Version 8.5.0 redesigns the bulk-sharing selector as compact searchable cards
+with integrated selection marks, counters, and clear All/None controls.
+Recipients of shared ontology definitions can now both edit and delete them.
+KPI `identification` is replaced by an editable `code`: new KPI forms propose a
+UUID automatically, the backend supplies one when absent, and custom codes do
+not need to be unique. Existing `orca:identification` values are migrated to
+the new functional `orca:code` datatype property with range `xsd:string`.
+
+Version 8.4.0 aligns every permission lock at the far right of the Data sidebar,
+independently of label length. Definitions and every graph level now expose a
+bulk sharing workflow: owners can select all or any subset of the currently
+visible resources and add the same users or teams in one operation. Existing
+grants are preserved. Node owners can bulk-share only their own resources;
+definition sharing remains reserved to special users and administrators, and
+role-based editing restrictions continue to apply to every recipient.
+
+Version 8.3.0 adds permission cues to the Data sidebar. A new `Niveles`
+heading groups the graph entity sections; an open or closed lock indicates
+whether the current user can modify that level, and a selected read-only level
+uses orange instead of green. Ontology definitions can now be shared by special
+users and administrators with individual users or teams. Delegated recipients
+can edit those definitions and can delete non-core definitions, while core
+ontology concepts remain protected from deletion.
+
+Version 8.2.0 makes the application navigation responsive. Below 1100 pixels,
+the desktop header actions are replaced by a right-aligned hamburger menu that
+contains all views, presence information, account actions and role-dependent
+administration options. The left navigation can now be collapsed and restored
+in Data, Graph and Explore views; it remains expanded by default on every load.
+
+Version 8.1.0 completes the sharing interface with a visible Share action in
+every entity table. Sharing a value chain grants access to its current and
+future nodes through their `orca:inValueChain` context. Delegation never raises
+the recipient's role: normal users can edit or delete shared scopes, components,
+subcomponents, elements and KPI, while special users and administrators can
+also modify shared chains,
+links and agents. Team editing now uses searchable member selection and
+removable chips, and team action buttons retain readable labels at every width.
+
+Version 8.0.0 introduces teams and delegated node permissions. Special users
+and administrators can create uniquely named teams and manage multiple members;
+normal users can inspect their memberships and leave a team. A node owner can
+grant the complete edit-and-delete capability to individual users or teams.
+Team-derived access is evaluated dynamically, so leaving or deleting a team
+revokes that access immediately. Ownership does not change and only the owner
+can manage a node's grants. The semantic model adds `orca:Team`, `orca:User`,
+`orca:hasMember` and `orca:memberOf`; teams have exactly one `orca:name`
+literal with datatype `xsd:string`.
 
 Version 7.33.0 lets special users and administrators duplicate any existing value chain. The user supplies a new globally unique name and the backend clones the complete chain workspace into the requesting user's named graph. Every application resource receives a new IRI, internal relations are rewired to the new resources, RDF types and literal datatypes are preserved, and legacy resources without explicit `orca:inValueChain` assertions are assigned to the new chain. The source chain remains unchanged.
 
@@ -86,10 +181,10 @@ controls with removable tags, a unified agent form with conditional subtype,
 and multiple link/component relationships. Version 7.3.0 added ownership-aware
 edit and delete actions to every entity
 table. It also exports the complete data workspace to one Excel workbook with
-separate sheets for chains, links, scopes, components, agents, KPI and
+separate sheets for chains, links, scopes, components, subcomponents, elements, agents, KPI and
 relations.
 
-## Semantic model v7
+## Semantic model v8
 
 | Source | Relation | Target |
 |---|---|---|
@@ -98,6 +193,8 @@ relations.
 | `orca:Component` | `orca:hasKPI` | `orca:KPI` |
 | `orca:KPI` | `orca:appliesToComponent` | `orca:Component` |
 | `orca:KPI` | `orca:similarTo` | `orca:KPI` |
+| `orca:Team` | `orca:hasMember` | `orca:User` |
+| `orca:User` | `orca:memberOf` | `orca:Team` |
 | `orca:ValueChain` | `orca:hasValueChainLink` | `orca:ValueChainLink` |
 | `orca:PrincipalAgent` | `orca:belongsTo` | `orca:ValueChainLink` |
 | `orca:AuxiliaryAgent` | `orca:participatesInValueChainLink` | `orca:ValueChainLink` |
@@ -108,15 +205,15 @@ relations.
 | `orca:ValueChainLink` | `orca:precedes` | `orca:ValueChainLink` |
 
 The ontology uses English IRIs and bilingual `rdfs:label` and `rdfs:comment`
-annotations. KPI names, identifications, descriptions and evaluations use the
-datatype properties `orca:name`, `orca:identification`, `orca:description` and
+annotations. KPI names, codes, descriptions and evaluations use the
+datatype properties `orca:name`, `orca:code`, `orca:description` and
 `orca:evaluation`, all with range `xsd:string`.
 
 These rules are enforced by both the GUI and API:
 
-- A `Scope` relates to zero or more components and is not hierarchical.
-- Components may form a hierarchy through `hasSubcomponent`.
-- KPI classification uses components, never scopes.
+- A `Scope` relates only to zero or more `Component` instances and is not hierarchical.
+- `Component` relates N:N to `Subcomponent`; `Subcomponent` relates N:N to `Element`, with explicit inverse triples.
+- KPI classification can use components, subcomponents or elements, never scopes.
 - `similarTo` is symmetric and connects two KPIs.
 - A value chain link requires a value chain.
 - A principal agent belongs to a value-chain link.
@@ -125,7 +222,7 @@ These rules are enforced by both the GUI and API:
   Government support agents may additionally be national or regional. These
   categories are modeled as an OWL subclass hierarchy and selected through a
   controlled dropdown when the node is created.
-- Every KPI requires a name, identification, description and evaluation, and can relate to agents and components.
+- Every KPI requires a name, code, description and evaluation, and can relate to agents, components, subcomponents and elements.
   `https://orca-graph.example/graph/ontology/om-2.0`.
 - A KPI may be related simultaneously to components, value-chain links and
   agents of any type.
@@ -163,7 +260,7 @@ The backend follows these rules:
 - Administrator accounts can create or permanently delete users and assign
   normal, special, or administrator roles.
 - Special users and administrators can create chains and value-chain links.
-- Normal users create and edit scopes, components, agents, and KPIs.
+- Normal users create and edit scopes, components, subcomponents, elements and KPIs.
 - Deleting a user removes their sessions, relational account, complete RDF
   named graph and every relation in other graphs that references their nodes.
 - Every authenticated user can change their own password after confirming the
@@ -211,7 +308,7 @@ agent and delivery KPI.
 ## Data and graph views
 
 The application opens in a table-based data workspace with separate sections
-for scopes, components, KPI, agents, value chains and relations. Search and
+for scopes, components, subcomponents, elements, KPI, agents, value chains and relations. Search and
 authorship filters work over the same live GraphDB snapshot used by the graph
 view. Selecting a row can focus the corresponding node in the graph; no RDF is
 duplicated between the two interfaces.
@@ -259,8 +356,9 @@ collaboration and read-only attribution.
 Every application entity is stored in the named graph of a real user. Version
 7.6.0 removes the legacy global seed graph during startup, so no value chain,
 link, scope, component, agent, or KPI is displayed without an owner. Example
-entities are attributed to their corresponding bootstrap accounts and can be
-managed according to the normal ownership and role rules.
+entities are attributed to their corresponding bootstrap accounts. Owners can
+delegate edit-and-delete rights to users or teams without transferring
+ownership. Delegated users cannot change sharing grants.
 
 ## GUI
 
@@ -294,7 +392,7 @@ The interface includes:
 - Filters by scope, user, node type and node neighbourhood.
 - Dynamic layout for small and larger graphs.
 - Creation dialogs that only expose valid semantic combinations.
-- KPI forms with required identification, description and evaluation fields and selectors for agents and components.
+- KPI forms with an automatically proposed editable code, required description and evaluation fields, and selectors for agents and all three component levels.
 
 Node shapes and colors encode the seven node types. The node name and author
 initials are displayed inside each shape.

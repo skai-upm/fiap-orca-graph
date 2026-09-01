@@ -22,6 +22,7 @@ from .domain import (
     UnitOption,
     OntologyConcept,
     UserPublic,
+    role_can_manage_node_type,
 )
 
 
@@ -90,7 +91,7 @@ class GraphDB:
         raise RuntimeError("GraphDB repository is not ready")
 
     async def migrate_kpi_text_fields(self) -> None:
-        """Move legacy KPI definitions to descriptions and initialise new fields."""
+        """Migrate legacy KPI text fields and initialise code and evaluation."""
         await self.update(
             f"""
             INSERT {{ GRAPH ?graph {{ ?kpi {sparql_iri(f'{ORCA}description')} ?definition }} }}
@@ -114,7 +115,25 @@ class GraphDB:
             }}
             """
         )
-        for property_name in ("identification", "evaluation"):
+        await self.update(
+            f"""
+            INSERT {{ GRAPH ?graph {{ ?kpi {sparql_iri(f'{ORCA}code')} ?identification }} }}
+            WHERE {{
+              GRAPH ?graph {{
+                ?kpi a {sparql_iri(f'{ORCA}KPI')} ;
+                     {sparql_iri(f'{ORCA}identification')} ?identification .
+              }}
+              FILTER NOT EXISTS {{ GRAPH ?graph {{ ?kpi {sparql_iri(f'{ORCA}code')} ?existingCode }} }}
+            }}
+            """
+        )
+        await self.update(
+            f"""
+            DELETE {{ GRAPH ?graph {{ ?kpi {sparql_iri(f'{ORCA}identification')} ?identification }} }}
+            WHERE {{ GRAPH ?graph {{ ?kpi a {sparql_iri(f'{ORCA}KPI')} ; {sparql_iri(f'{ORCA}identification')} ?identification }} }}
+            """
+        )
+        for property_name in ("code", "evaluation"):
             await self.update(
                 f"""
                 INSERT {{ GRAPH ?graph {{ ?kpi {sparql_iri(f'{ORCA}{property_name}')} "" }} }}
@@ -126,6 +145,63 @@ class GraphDB:
                 }}
                 """
             )
+
+    async def migrate_component_levels(self) -> None:
+        """Convert the former Component-to-Component hierarchy into three explicit levels."""
+        component = sparql_iri(f"{ORCA}Component")
+        subcomponent = sparql_iri(f"{ORCA}Subcomponent")
+        element = sparql_iri(f"{ORCA}Element")
+        has_component = sparql_iri(f"{ORCA}hasComponent")
+        has_subcomponent = sparql_iri(f"{ORCA}hasSubcomponent")
+        old_inverse = sparql_iri(f"{ORCA}hasSupercomponent")
+        is_subcomponent_of = sparql_iri(f"{ORCA}isSubcomponentOf")
+        has_element = sparql_iri(f"{ORCA}hasElement")
+        is_element_of = sparql_iri(f"{ORCA}isElementOf")
+        await self.update(f"""
+            DELETE {{ GRAPH ?typeGraph {{ ?child a {component} }} }}
+            INSERT {{ GRAPH ?typeGraph {{ ?child a {subcomponent} }} }}
+            WHERE {{
+              GRAPH ?graph {{ ?parent {has_subcomponent} ?child }}
+              GRAPH ?typeGraph {{ ?child a {component} }}
+              FILTER(
+                EXISTS {{ GRAPH ?anchorGraph {{ ?scope {has_component} ?parent }} }} ||
+                NOT EXISTS {{ GRAPH ?ancestorGraph {{ ?ancestor {has_subcomponent} ?parent }} }}
+              )
+              FILTER NOT EXISTS {{ GRAPH ?scopeGraph {{ ?scope {has_component} ?child }} }}
+            }}
+        """)
+        await self.update(f"""
+            DELETE {{ GRAPH ?typeGraph {{ ?child a {component} . ?child a {subcomponent} }} }}
+            INSERT {{ GRAPH ?typeGraph {{ ?child a {element} }} }}
+            WHERE {{
+              GRAPH ?graph {{ ?parent {has_subcomponent} ?child }}
+              GRAPH ?parentGraph {{ ?parent a {subcomponent} }}
+              GRAPH ?typeGraph {{ ?child a ?oldType . FILTER(?oldType IN ({component}, {subcomponent})) }}
+            }}
+        """)
+        await self.update(f"""
+            DELETE {{ GRAPH ?graph {{ ?parent {has_subcomponent} ?child . ?child {old_inverse} ?parent }} }}
+            INSERT {{ GRAPH ?graph {{ ?parent {has_element} ?child . ?child {is_element_of} ?parent }} }}
+            WHERE {{
+              GRAPH ?graph {{ ?parent {has_subcomponent} ?child }}
+              GRAPH ?parentGraph {{ ?parent a {subcomponent} }}
+              GRAPH ?childGraph {{ ?child a {element} }}
+            }}
+        """)
+        await self.update(f"""
+            DELETE {{ GRAPH ?graph {{ ?child {old_inverse} ?parent }} }}
+            INSERT {{ GRAPH ?graph {{ ?child {is_subcomponent_of} ?parent }} }}
+            WHERE {{
+              GRAPH ?graph {{ ?parent {has_subcomponent} ?child }}
+              GRAPH ?parentGraph {{ ?parent a {component} }}
+              GRAPH ?childGraph {{ ?child a {subcomponent} }}
+              OPTIONAL {{ GRAPH ?graph {{ ?child {old_inverse} ?parent }} }}
+            }}
+        """)
+        await self.update(f"""
+            DELETE {{ GRAPH ?graph {{ ?child {old_inverse} ?parent }} }}
+            WHERE {{ GRAPH ?graph {{ ?child {old_inverse} ?parent }} }}
+        """)
 
     async def query(self, sparql: str) -> dict:
         async with httpx.AsyncClient(timeout=20) as client:
@@ -209,7 +285,7 @@ class GraphDB:
                 label=self._spanish_literal(ontology, subject, RDFS.label) or str(subject).rsplit("/", 1)[-1],
                 definition=self._spanish_literal(ontology, subject, RDFS.comment),
                 visible=visible,
-                deletable=not (core is not None and bool(core.toPython())),
+                deletable=True,
             ))
         return sorted(concepts, key=lambda item: item.label.casefold())
 
@@ -271,7 +347,7 @@ class GraphDB:
             core = next(ontology.objects(subject, URIRef(f"{ORCA}coreConcept")), None)
             return OntologyConcept(
                 iri=str(subject), label=label, definition=definition, visible=visible,
-                deletable=not (core is not None and bool(core.toPython())),
+                deletable=True,
             )
 
     async def set_concept_visibility(self, concept_iri: str, visible: bool) -> OntologyConcept:
@@ -300,7 +376,7 @@ class GraphDB:
                 label=self._spanish_literal(ontology, subject, RDFS.label) or concept_iri.rsplit("/", 1)[-1],
                 definition=self._spanish_literal(ontology, subject, RDFS.comment),
                 visible=visible,
-                deletable=not bool(next(ontology.objects(subject, URIRef(f"{ORCA}coreConcept")), Literal(False)).toPython()),
+                deletable=True,
             )
 
     async def delete_concept(self, concept_iri: str) -> None:
@@ -309,9 +385,6 @@ class GraphDB:
             subject = URIRef(concept_iri)
             if (subject, RDF.type, OWL.Class) not in ontology:
                 raise LookupError("Concepto ontológico no encontrado")
-            core = next(ontology.objects(subject, URIRef(f"{ORCA}coreConcept")), None)
-            if core is not None and bool(core.toPython()):
-                raise PermissionError("Los conceptos originales de la ontología no se pueden borrar; solo editar")
             ontology.remove((subject, None, None))
             ontology.remove((None, None, subject))
             serialized = ontology.serialize(format="turtle")
@@ -338,6 +411,8 @@ class GraphDB:
               GRAPH ?graph {{
                 {sparql_iri(node_id)} a ?type .
                 FILTER(?type IN ({self.node_type_iris()}))
+                FILTER(?type != {sparql_iri(f'{ORCA}Component')} || NOT EXISTS {{ {sparql_iri(node_id)} a ?specificType . FILTER(?specificType IN ({sparql_iri(f'{ORCA}Subcomponent')}, {sparql_iri(f'{ORCA}Element')})) }})
+                FILTER(?type != {sparql_iri(f'{ORCA}Subcomponent')} || NOT EXISTS {{ {sparql_iri(node_id)} a {sparql_iri(f'{ORCA}Element')} }})
               }}
             }} LIMIT 1
             """
@@ -347,6 +422,19 @@ class GraphDB:
             return None
         row = bindings[0]
         return row["graph"]["value"], NodeType(row["type"]["value"].removeprefix(ORCA))
+
+    async def node_chain_id(self, node_id: str) -> str | None:
+        result = await self.query(
+            f"""
+            SELECT ?chain WHERE {{
+              GRAPH ?graph {{
+                {sparql_iri(node_id)} {sparql_iri(f"{ORCA}inValueChain")} ?chain .
+              }}
+            }} LIMIT 1
+            """
+        )
+        bindings = result.get("results", {}).get("bindings", [])
+        return bindings[0]["chain"]["value"] if bindings else None
 
     async def source_relation_types(self, node_id: str) -> set[RelationType]:
         result = await self.query(
@@ -372,7 +460,7 @@ class GraphDB:
         node_type: NodeType,
         name: str,
         description: str,
-        identification: str | None,
+        code: str | None,
         evaluation: str | None,
         unit_iri: str | None,
         parent_id: str | None,
@@ -385,9 +473,9 @@ class GraphDB:
             properties.append(
                 f"{sparql_iri(f'{ORCA}description')} {sparql_string(description)}"
             )
-        if identification:
+        if code:
             properties.append(
-                f"{sparql_iri(f'{ORCA}identification')} {sparql_string(identification)}"
+                f"{sparql_iri(f'{ORCA}code')} {sparql_string(code)}"
             )
         if evaluation:
             properties.append(
@@ -569,14 +657,14 @@ class GraphDB:
         node_type: NodeType,
         name: str,
         description: str,
-        identification: str | None,
+        code: str | None,
         evaluation: str | None,
         unit_iri: str | None,
         support_agent_subtype: SupportAgentSubtype | None,
     ) -> None:
         editable_properties = [
             f"{ORCA}name", f"{ORCA}description", f"{ORCA}definition",
-            f"{ORCA}identification", f"{ORCA}evaluation",
+            f"{ORCA}identification", f"{ORCA}code", f"{ORCA}evaluation",
             f"{ORCA}hasApplicationLevel", f"{ORCA}applicationScope",
             f"{ORCA}unitOfMeasure",
         ]
@@ -611,8 +699,8 @@ class GraphDB:
         properties = [f"{sparql_iri(f'{ORCA}name')} {sparql_string(name)}"]
         if description:
             properties.append(f"{sparql_iri(f'{ORCA}description')} {sparql_string(description)}")
-        if identification:
-            properties.append(f"{sparql_iri(f'{ORCA}identification')} {sparql_string(identification)}")
+        if code:
+            properties.append(f"{sparql_iri(f'{ORCA}code')} {sparql_string(code)}")
         if evaluation:
             properties.append(f"{sparql_iri(f'{ORCA}evaluation')} {sparql_string(evaluation)}")
         if unit_iri:
@@ -735,18 +823,23 @@ class GraphDB:
         self,
         users: list[UserPublic],
         current_user_id: str,
+        delegated_node_ids: set[str] | None = None,
+        current_user_role: str | None = None,
     ) -> GraphSnapshot:
+        delegated_node_ids = delegated_node_ids or set()
         user_by_graph = {user.graph_uri: user for user in users}
         node_result = await self.query(
             f"""
-            SELECT ?graph ?id ?type ?name ?description ?identification ?evaluation
+            SELECT ?graph ?id ?type ?name ?description ?code ?evaluation
                    ?supportAgentSubtype ?chain
             WHERE {{
               GRAPH ?graph {{
                 ?id a ?type ; {sparql_iri(f"{ORCA}name")} ?name .
                 FILTER(?type IN ({self.node_type_iris()}))
+                FILTER(?type != {sparql_iri(f'{ORCA}Component')} || NOT EXISTS {{ ?id a ?specificType . FILTER(?specificType IN ({sparql_iri(f'{ORCA}Subcomponent')}, {sparql_iri(f'{ORCA}Element')})) }})
+                FILTER(?type != {sparql_iri(f'{ORCA}Subcomponent')} || NOT EXISTS {{ ?id a {sparql_iri(f'{ORCA}Element')} }})
                 OPTIONAL {{ ?id {sparql_iri(f"{ORCA}description")} ?description }}
-                OPTIONAL {{ ?id {sparql_iri(f"{ORCA}identification")} ?identification }}
+                OPTIONAL {{ ?id {sparql_iri(f"{ORCA}code")} ?code }}
                 OPTIONAL {{ ?id {sparql_iri(f"{ORCA}evaluation")} ?evaluation }}
                 OPTIONAL {{ ?id {sparql_iri(f"{ORCA}inValueChain")} ?chain }}
                 OPTIONAL {{
@@ -778,7 +871,7 @@ class GraphDB:
                     type=NodeType(row["type"]["value"].removeprefix(ORCA)),
                     name=row["name"]["value"],
                     description=row.get("description", {}).get("value", ""),
-                    identification=row.get("identification", {}).get("value"),
+                    code=row.get("code", {}).get("value"),
                     evaluation=row.get("evaluation", {}).get("value"),
                     support_agent_subtype=(
                         SupportAgentSubtype(
@@ -795,7 +888,16 @@ class GraphDB:
                     owner_id=owner.id if owner else None,
                     owner_name=owner.display_name if owner else "ORCA Graph",
                     owner_initials=owner.initials if owner else "OG",
-                    editable=owner is not None and owner.id == current_user_id,
+                    editable=(owner is not None and owner.id == current_user_id) or (
+                        (
+                            row["id"]["value"] in delegated_node_ids
+                            or row.get("chain", {}).get("value") in delegated_node_ids
+                        )
+                        and role_can_manage_node_type(
+                            current_user_role or "",
+                            NodeType(row["type"]["value"].removeprefix(ORCA)),
+                        )
+                    ),
                     chain_id=row.get("chain", {}).get("value"),
                 )
             )
@@ -803,6 +905,7 @@ class GraphDB:
         visible_relation_types = {
             RelationType.HAS_COMPONENT,
             RelationType.HAS_SUBCOMPONENT,
+            RelationType.HAS_ELEMENT,
             RelationType.SIMILAR_TO,
             RelationType.HAS_VALUE_CHAIN_LINK,
             RelationType.BELONGS_TO,
@@ -831,10 +934,31 @@ class GraphDB:
         )
         relations: list[Relation] = []
         seen_relations: set[tuple[str, str, str]] = set()
-        for row in relation_result["results"]["bindings"]:
+        relation_rows = relation_result["results"]["bindings"]
+        specific_link_predicates = {
+            RelationType.MOVES_FRESH_FISH.iri,
+            RelationType.MOVES_DRY_FISH.iri,
+            RelationType.MOVES_FISHMEAL.iri,
+            RelationType.TRANSFERS_FUNDING.iri,
+        }
+        specifically_related_pairs = {
+            frozenset((row["source"]["value"], row["target"]["value"]))
+            for row in relation_rows
+            if row["predicate"]["value"] in specific_link_predicates
+        }
+        for row in relation_rows:
             source = row["source"]["value"]
             target = row["target"]["value"]
             predicate = row["predicate"]["value"]
+            if (
+                predicate == RelationType.IS_RELATED.iri
+                and frozenset((source, target)) in specifically_related_pairs
+            ):
+                # Older inference indexes may still expose the former
+                # subproperty entailment until GraphDB refreshes its rules.
+                # Never display that generic duplicate beside the explicit
+                # relation chosen in the value-chain-link form.
+                continue
             key = (
                 (min(source, target), predicate, max(source, target))
                 if predicate == RelationType.SIMILAR_TO.iri

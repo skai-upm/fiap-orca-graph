@@ -14,6 +14,8 @@ def test_orca_ontology_is_valid_and_contains_complete_model():
     for term in [
         orca.Scope,
         orca.Component,
+        orca.Subcomponent,
+        orca.Element,
         orca.KPI,
         orca.Agent,
         orca.PrincipalAgent,
@@ -27,6 +29,8 @@ def test_orca_ontology_is_valid_and_contains_complete_model():
         orca.LocalGovernmentSupportAgent,
         orca.ValueChain,
         orca.ValueChainLink,
+        orca.User,
+        orca.Team,
     ]:
         assert (term, RDF.type, OWL.Class) in graph
         assert (term, orca.coreConcept, Literal(True, datatype=XSD.boolean)) in graph
@@ -35,7 +39,9 @@ def test_orca_ontology_is_valid_and_contains_complete_model():
         orca.hasComponent,
         orca.isComponentOf,
         orca.hasSubcomponent,
-        orca.hasSupercomponent,
+        orca.isSubcomponentOf,
+        orca.hasElement,
+        orca.isElementOf,
         orca.similarTo,
         orca.hasValueChainLink,
         orca.belongsTo,
@@ -50,23 +56,27 @@ def test_orca_ontology_is_valid_and_contains_complete_model():
         orca.mueveHarinaDePescado,
         orca["financiación"],
         orca.inValueChain,
+        orca.hasMember,
+        orca.memberOf,
     ]:
         assert (term, RDF.type, OWL.ObjectProperty) in graph
 
     assert (orca.unitOfMeasure, None, None) not in graph
     assert (orca.definition, None, None) not in graph
-    for term in [orca.name, orca.identification, orca.description, orca.evaluation]:
+    for term in [orca.name, orca.code, orca.description, orca.evaluation]:
         assert (term, RDF.type, OWL.DatatypeProperty) in graph
         assert (term, RDFS.range, XSD.string) in graph
     assert (orca.inValueChain, RDFS.range, orca.ValueChain) in graph
+    assert (orca.Subcomponent, RDFS.subClassOf, orca.Component) in graph
+    assert (orca.Element, RDFS.subClassOf, orca.Subcomponent) in graph
 
     assert (orca.similarTo, RDF.type, OWL.SymmetricProperty) in graph
     for term in [orca.muevePescadoFresco, orca.muevePescadoSeco, orca.mueveHarinaDePescado, orca["financiación"]]:
-        assert (term, RDFS.subPropertyOf, orca.isRelated) in graph
+        assert (term, RDFS.subPropertyOf, orca.isRelated) not in graph
 
 
 @pytest.mark.asyncio
-async def test_only_later_concepts_are_deletable(monkeypatch):
+async def test_all_editable_concepts_are_deletable(monkeypatch):
     orca = Namespace("https://orca-graph.example/ontology/")
     ontology = Graph()
     ontology.add((orca.KPI, RDF.type, OWL.Class))
@@ -78,5 +88,5 @@ async def test_only_later_concepts_are_deletable(monkeypatch):
     monkeypatch.setattr(graphdb, "_read_ontology", lambda: ontology)
 
     concepts = {concept.iri: concept for concept in await graphdb.concepts(include_hidden=True)}
-    assert concepts[str(orca.KPI)].deletable is False
+    assert concepts[str(orca.KPI)].deletable is True
     assert concepts[str(later)].deletable is True

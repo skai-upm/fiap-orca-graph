@@ -7,25 +7,42 @@ from fastapi.middleware.cors import CORSMiddleware
 from .auth import CurrentUser, SESSION_COOKIE
 from .config import settings
 from .database import (
+    add_concept_permissions_bulk,
+    add_node_permissions_bulk,
     authenticate,
     create_session,
     create_or_reactivate_user,
+    create_team,
+    concept_permissions,
+    delete_concept_permissions,
+    delete_node_permissions,
+    delete_team,
     delete_user_permanently,
     get_user,
     initialize_database,
     list_users,
+    list_teams,
+    leave_team,
+    node_permissions,
+    replace_node_permissions,
+    replace_concept_permissions,
     revoke_session,
     update_password,
+    update_team,
+    user_editable_node_ids,
+    user_editable_concept_iris,
     user_from_token,
 )
 from .domain import (
     ALLOWED_RELATIONS,
+    BulkPermissionUpdate,
     GraphSnapshot,
     LoginCommand,
     NEW_NODE_SOURCE_RELATIONS,
     Node,
     NodeCreate,
     NodeUpdate,
+    NodePermissionUpdate,
     NodeType,
     OntologyConcept,
     OntologyConceptCreate,
@@ -35,11 +52,15 @@ from .domain import (
     RelationCreate,
     RelationType,
     SupportAgentSubtype,
+    Team,
+    TeamCreate,
+    TeamUpdate,
     UserCreateCommand,
     UserPublic,
     UserRole,
     ValueChainDuplicate,
     validate_relation,
+    role_can_manage_node_type,
 )
 from .graphdb import graphdb
 from .realtime import hub
@@ -52,10 +73,11 @@ async def lifespan(_: FastAPI):
     await graphdb.wait_until_ready()
     await graphdb.seed(await list_users())
     await graphdb.migrate_kpi_text_fields()
+    await graphdb.migrate_component_levels()
     yield
 
 
-app = FastAPI(title="ORCA Graph API", version="7.33.0", lifespan=lifespan)
+app = FastAPI(title="ORCA Graph API", version="8.11.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
@@ -114,6 +136,54 @@ async def change_password(command: PasswordChangeCommand, user: CurrentUser) -> 
 @app.get("/api/users", response_model=list[UserPublic])
 async def users(_user: CurrentUser) -> list[UserPublic]:
     return await list_users()
+
+
+def require_team_manager(user: CurrentUser) -> None:
+    if user.role not in {UserRole.ADMIN.value, UserRole.SPECIAL.value}:
+        raise HTTPException(status_code=403, detail="Solo los usuarios especiales o administradores pueden gestionar equipos")
+
+
+@app.get("/api/teams", response_model=list[Team])
+async def teams(user: CurrentUser) -> list[Team]:
+    return await list_teams(None if user.role in {UserRole.ADMIN.value, UserRole.SPECIAL.value} else user.id)
+
+
+@app.post("/api/teams", response_model=Team, status_code=status.HTTP_201_CREATED)
+async def add_team(command: TeamCreate, user: CurrentUser) -> Team:
+    require_team_manager(user)
+    try:
+        return await create_team(command.name, command.member_ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.put("/api/teams/{team_id}", response_model=Team)
+async def edit_team(team_id: str, command: TeamUpdate, user: CurrentUser) -> Team:
+    require_team_manager(user)
+    try:
+        result = await update_team(team_id, command.name, command.member_ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="Equipo no encontrado")
+    return result
+
+
+@app.delete("/api/teams/{team_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def remove_team(team_id: str, user: CurrentUser) -> None:
+    require_team_manager(user)
+    if not await delete_team(team_id):
+        raise HTTPException(status_code=404, detail="Equipo no encontrado")
+
+
+@app.delete("/api/teams/{team_id}/membership", status_code=status.HTTP_204_NO_CONTENT)
+async def resign_from_team(team_id: str, user: CurrentUser) -> None:
+    if not await leave_team(team_id, user.id):
+        raise HTTPException(status_code=404, detail="No perteneces a ese equipo")
 
 
 @app.post("/api/users", response_model=UserPublic, status_code=status.HTTP_201_CREATED)
@@ -176,11 +246,19 @@ async def delete_user_account(user_id: str, user: CurrentUser) -> None:
 
 @app.get("/api/concepts", response_model=list[OntologyConcept])
 async def concepts(user: CurrentUser) -> list[OntologyConcept]:
-    return await graphdb.concepts(include_hidden=user.role in {UserRole.ADMIN.value, UserRole.SPECIAL.value})
+    result = await graphdb.concepts(include_hidden=user.role in {UserRole.ADMIN.value, UserRole.SPECIAL.value})
+    privileged = user.username == "orca" or user.role in {UserRole.ADMIN.value, UserRole.SPECIAL.value}
+    shared = await user_editable_concept_iris(user.id)
+    for concept in result:
+        concept.editable = privileged or concept.iri in shared
+        concept.deletable = concept.editable
+    return result
 
 
-def require_ontology_editor(user: CurrentUser) -> None:
-    if user.username != "orca" and user.role not in {UserRole.ADMIN.value, UserRole.SPECIAL.value}:
+async def require_ontology_editor(user: CurrentUser, concept_iri: str | None = None) -> None:
+    privileged = user.username == "orca" or user.role in {UserRole.ADMIN.value, UserRole.SPECIAL.value}
+    delegated = concept_iri is not None and concept_iri in await user_editable_concept_iris(user.id)
+    if not privileged and not delegated:
         raise HTTPException(
             status_code=403,
             detail="Solo los usuarios especiales o administradores pueden modificar definiciones",
@@ -189,7 +267,7 @@ def require_ontology_editor(user: CurrentUser) -> None:
 
 @app.post("/api/concepts", response_model=OntologyConcept, status_code=status.HTTP_201_CREATED)
 async def create_concept(command: OntologyConceptCreate, user: CurrentUser) -> OntologyConcept:
-    require_ontology_editor(user)
+    await require_ontology_editor(user)
     try:
         concept = await graphdb.save_concept(command.label, command.definition)
     except ValueError as exc:
@@ -216,7 +294,7 @@ async def update_concept_visibility(
 
 @app.put("/api/concepts", response_model=OntologyConcept)
 async def update_concept(concept_iri: str, command: OntologyConceptUpdate, user: CurrentUser) -> OntologyConcept:
-    require_ontology_editor(user)
+    await require_ontology_editor(user, concept_iri)
     try:
         concept = await graphdb.save_concept(command.label, command.definition, concept_iri)
     except LookupError as exc:
@@ -227,19 +305,51 @@ async def update_concept(concept_iri: str, command: OntologyConceptUpdate, user:
 
 @app.delete("/api/concepts", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_concept(concept_iri: str, user: CurrentUser) -> None:
-    require_ontology_editor(user)
+    await require_ontology_editor(user, concept_iri)
     try:
         await graphdb.delete_concept(concept_iri)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    await delete_concept_permissions(concept_iri)
     await hub.publish({
         "type": "ontology.changed",
         "action": "concept.deleted",
         "actor": user.public().model_dump(),
         "concept_iri": concept_iri,
     })
+
+
+@app.get("/api/concepts/permissions", response_model=list[dict])
+async def get_concept_permissions(concept_iri: str, user: CurrentUser) -> list[dict]:
+    require_team_manager(user)
+    return [item.model_dump() for item in await concept_permissions(concept_iri)]
+
+
+@app.put("/api/concepts/permissions", response_model=list[dict])
+async def set_concept_permissions(concept_iri: str, command: NodePermissionUpdate, user: CurrentUser) -> list[dict]:
+    require_team_manager(user)
+    known = {item.iri for item in await graphdb.concepts(include_hidden=True)}
+    if concept_iri not in known:
+        raise HTTPException(status_code=404, detail="Definición no encontrada")
+    try:
+        await replace_concept_permissions(concept_iri, command.grants)
+    except LookupError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return [item.model_dump() for item in await concept_permissions(concept_iri)]
+
+
+@app.post("/api/concepts/permissions/bulk", status_code=status.HTTP_204_NO_CONTENT)
+async def add_bulk_concept_permissions(command: BulkPermissionUpdate, user: CurrentUser) -> None:
+    require_team_manager(user)
+    known = {item.iri for item in await graphdb.concepts(include_hidden=True)}
+    if any(concept_iri not in known for concept_iri in command.resource_ids):
+        raise HTTPException(status_code=404, detail="Alguna definición seleccionada ya no existe")
+    try:
+        await add_concept_permissions_bulk(command.resource_ids, command.grants)
+    except LookupError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/api/model")
@@ -259,7 +369,16 @@ async def model(_user: CurrentUser) -> dict:
 
 @app.get("/api/graph", response_model=GraphSnapshot)
 async def graph(user: CurrentUser) -> GraphSnapshot:
-    return await graphdb.snapshot(await list_users(include_inactive=True), user.id)
+    return await graphdb.snapshot(await list_users(include_inactive=True), user.id, await user_editable_node_ids(user.id), user.role)
+
+
+async def has_delegated_node_access(user: CurrentUser, node_id: str, node_type: NodeType) -> bool:
+    grants = await user_editable_node_ids(user.id)
+    chain_id = await graphdb.node_chain_id(node_id)
+    delegated = node_id in grants or (chain_id is not None and chain_id in grants)
+    if not delegated:
+        return False
+    return role_can_manage_node_type(user.role, node_type)
 
 
 @app.post("/api/nodes", response_model=Node, status_code=status.HTTP_201_CREATED)
@@ -317,7 +436,7 @@ async def create_node(command: NodeCreate, user: CurrentUser) -> Node:
         node_type=command.type,
         name=command.name.strip(),
         description=command.description.strip(),
-        identification=command.identification,
+        code=command.code,
         evaluation=command.evaluation,
         unit_iri=None,
         support_agent_subtype=command.support_agent_subtype,
@@ -330,7 +449,7 @@ async def create_node(command: NodeCreate, user: CurrentUser) -> Node:
         type=command.type,
         name=command.name.strip(),
         description=command.description.strip(),
-        identification=command.identification,
+        code=command.code,
         evaluation=command.evaluation,
         support_agent_subtype=command.support_agent_subtype,
         graph=user.graph_uri,
@@ -412,7 +531,7 @@ async def duplicate_value_chain(
             status_code=409,
             detail="Ya existe una cadena de valor con ese nombre",
         )
-    snapshot = await graphdb.snapshot(await list_users(include_inactive=True), user.id)
+    snapshot = await graphdb.snapshot(await list_users(include_inactive=True), user.id, await user_editable_node_ids(user.id), user.role)
     node_ids = _node_ids_for_chain(snapshot, chain_id)
     try:
         new_chain_id = await graphdb.duplicate_value_chain(
@@ -423,7 +542,7 @@ async def duplicate_value_chain(
         )
     except (LookupError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    updated = await graphdb.snapshot(await list_users(include_inactive=True), user.id)
+    updated = await graphdb.snapshot(await list_users(include_inactive=True), user.id, await user_editable_node_ids(user.id), user.role)
     node = next(item for item in updated.nodes if item.id == new_chain_id)
     await hub.publish({
         "type": "graph.changed",
@@ -441,17 +560,18 @@ async def update_node(node_id: str, command: NodeUpdate, user: CurrentUser) -> N
     if existing is None:
         raise HTTPException(status_code=404, detail="Nodo no encontrado")
     graph_uri, node_type = existing
-    if graph_uri != user.graph_uri:
-        raise HTTPException(status_code=403, detail="Solo puedes editar entidades creadas por ti")
+    delegated = graph_uri != user.graph_uri and await has_delegated_node_access(user, node_id, node_type)
+    if graph_uri != user.graph_uri and not delegated:
+        raise HTTPException(status_code=403, detail="No tienes permisos para editar este nodo")
     privileged_roles = {UserRole.ADMIN.value, UserRole.SPECIAL.value}
-    if node_type == NodeType.AUXILIARY_AGENT and user.role not in privileged_roles:
+    if node_type == NodeType.AUXILIARY_AGENT and user.role not in privileged_roles and not delegated:
         raise HTTPException(
             status_code=403,
             detail="Solo los usuarios especiales o administradores pueden editar agentes auxiliares",
         )
     if (
         command.support_agent_subtype == SupportAgentSubtype.LOCAL_GOVERNMENT
-        and user.role not in privileged_roles
+        and user.role not in privileged_roles and not delegated
     ):
         raise HTTPException(
             status_code=403,
@@ -462,7 +582,7 @@ async def update_node(node_id: str, command: NodeUpdate, user: CurrentUser) -> N
             type=node_type,
             name=command.name,
             description=command.description,
-            identification=command.identification,
+            code=command.code,
             evaluation=command.evaluation,
             support_agent_subtype=command.support_agent_subtype,
             parent={"parent_id": node_id, "relation": "similarTo"}
@@ -481,12 +601,12 @@ async def update_node(node_id: str, command: NodeUpdate, user: CurrentUser) -> N
         node_type=node_type,
         name=validated.name,
         description=validated.description,
-        identification=validated.identification,
+        code=validated.code,
         evaluation=validated.evaluation,
         unit_iri=None,
         support_agent_subtype=validated.support_agent_subtype,
     )
-    snapshot = await graphdb.snapshot(await list_users(include_inactive=True), user.id)
+    snapshot = await graphdb.snapshot(await list_users(include_inactive=True), user.id, await user_editable_node_ids(user.id), user.role)
     node = next(item for item in snapshot.nodes if item.id == node_id)
     await hub.publish({"type": "graph.changed", "action": "node.updated", "actor": user.public().model_dump(), "node": node.model_dump()})
     return node
@@ -611,17 +731,57 @@ async def delete_relation(command: RelationCreate, user: CurrentUser) -> None:
     )
 
 
+@app.get("/api/nodes/permissions", response_model=list[dict])
+async def get_node_permissions(node_id: str, user: CurrentUser) -> list[dict]:
+    node = await graphdb.node(node_id)
+    if node is None:
+        raise HTTPException(status_code=404, detail="Nodo no encontrado")
+    if node[0] != user.graph_uri:
+        raise HTTPException(status_code=403, detail="Solo el propietario puede consultar o cambiar los permisos")
+    return [item.model_dump() for item in await node_permissions(node_id)]
+
+
+@app.put("/api/nodes/permissions", response_model=list[dict])
+async def set_node_permissions(node_id: str, command: NodePermissionUpdate, user: CurrentUser) -> list[dict]:
+    node = await graphdb.node(node_id)
+    if node is None:
+        raise HTTPException(status_code=404, detail="Nodo no encontrado")
+    if node[0] != user.graph_uri:
+        raise HTTPException(status_code=403, detail="Solo el propietario puede compartir el nodo")
+    try:
+        await replace_node_permissions(node_id, user.id, command.grants)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return [item.model_dump() for item in await node_permissions(node_id)]
+
+
+@app.post("/api/nodes/permissions/bulk", status_code=status.HTTP_204_NO_CONTENT)
+async def add_bulk_node_permissions(command: BulkPermissionUpdate, user: CurrentUser) -> None:
+    for node_id in command.resource_ids:
+        node = await graphdb.node(node_id)
+        if node is None:
+            raise HTTPException(status_code=404, detail="Algún nodo seleccionado ya no existe")
+        if node[0] != user.graph_uri:
+            raise HTTPException(status_code=403, detail="Solo puedes compartir en bloque nodos de tu propiedad")
+    try:
+        await add_node_permissions_bulk(command.resource_ids, user.id, command.grants)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @app.delete("/api/nodes", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_node(node_id: str, user: CurrentUser) -> None:
     node = await graphdb.node(node_id)
     if node is None:
         raise HTTPException(status_code=404, detail="Node not found")
-    if node[0] != user.graph_uri:
-        raise HTTPException(
-            status_code=403,
-            detail="You can only delete nodes created in your personal graph",
-        )
-    await graphdb.delete_node(user.graph_uri, node_id)
+    if node[0] != user.graph_uri and not await has_delegated_node_access(user, node_id, node[1]):
+        raise HTTPException(status_code=403, detail="No tienes permisos para borrar este nodo")
+    await graphdb.delete_node(node[0], node_id)
+    await delete_node_permissions(node_id)
     await hub.publish(
         {
             "type": "graph.changed",

@@ -1,18 +1,28 @@
 import cytoscape, { Core } from "cytoscape";
 import {
+  Check,
+  ChevronDown,
   CircleDot,
   Copy,
   FilterX,
   GitBranch,
   KeyRound,
+  Lock,
   LogOut,
+  Menu,
   Maximize2,
+  PanelLeftClose,
+  PanelLeftOpen,
+  PanelRightClose,
+  PanelRightOpen,
   FileSpreadsheet,
+  Github,
   Pencil,
   Plus,
   Search,
   ShieldCheck,
   Trash2,
+  Unlock,
   UserCog,
   UserPlus,
   Users,
@@ -32,12 +42,14 @@ import {
   RelationType,
   Snapshot,
   SupportAgentSubtype,
+  Team,
+  NodePermissionGrant,
   User,
   UserRole
 } from "./api";
 
 const emptySnapshot: Snapshot = { nodes: [], relations: [], current_user_id: "" };
-const APP_VERSION = "7.33.0";
+const APP_VERSION = "8.11.0";
 
 function snapshotForChain(snapshot: Snapshot, chainId: string | null): Snapshot {
   if (!chainId) return { ...snapshot, nodes: [], relations: [] };
@@ -110,6 +122,8 @@ const supportAgentSubtypeLabels: Record<SupportAgentSubtype, string> = {
 const typeInfo: Record<NodeType, { label: string; description: string }> = {
   Scope: { label: "Ámbito", description: "Área temática que agrupa componentes." },
   Component: { label: "Componente", description: "Elemento jerárquico que agrupa KPI." },
+  Subcomponent: { label: "Subcomponente", description: "Nivel intermedio entre componente y elemento." },
+  Element: { label: "Elemento", description: "Nivel específico contenido en uno o varios subcomponentes." },
   KPI: { label: "KPI", description: "Indicador aplicado a un agente o componente." },
   ValueChain: { label: "Cadena de valor", description: "Agrupación de eslabones." },
   ValueChainLink: { label: "Eslabón", description: "Etapa de una cadena de valor." },
@@ -122,7 +136,9 @@ const relationLabels: Record<RelationType, string> = {
   hasComponent: "tiene componente",
   isComponentOf: "es componente de",
   hasSubcomponent: "tiene subcomponente",
-  hasSupercomponent: "tiene supercomponente",
+  isSubcomponentOf: "es subcomponente de",
+  hasElement: "tiene elemento",
+  isElementOf: "es elemento de",
   similarTo: "similar a",
   hasValueChainLink: "tiene eslabón",
   isValueChainLinkOf: "es eslabón de",
@@ -154,12 +170,23 @@ const allowedMatrix: Partial<Record<NodeType, Partial<Record<NodeType, RelationT
   },
   Component: {
     Scope: ["isComponentOf"],
-    Component: ["hasSubcomponent", "hasSupercomponent"],
+    Subcomponent: ["hasSubcomponent"],
+    KPI: ["hasKPI"]
+  },
+  Subcomponent: {
+    Component: ["isSubcomponentOf"],
+    Element: ["hasElement"],
+    KPI: ["hasKPI"]
+  },
+  Element: {
+    Subcomponent: ["isElementOf"],
     KPI: ["hasKPI"]
   },
   KPI: {
     KPI: ["similarTo"],
     Component: ["appliesToComponent"],
+    Subcomponent: ["appliesToComponent"],
+    Element: ["appliesToComponent"],
     PrincipalAgent: ["appliesToAgent"],
     AuxiliaryAgent: ["appliesToAgent"],
     SupportAgent: ["appliesToAgent"]
@@ -197,84 +224,14 @@ function RdfMark() {
 }
 
 interface Filters {
-  scope: string[];
   user: string[];
   type: NodeType[];
   node: string[];
 }
 
-const emptyFilters: Filters = { scope: [], user: [], type: [], node: [] };
-
-const agentTypes = new Set<NodeType>(["PrincipalAgent", "AuxiliaryAgent", "SupportAgent"]);
-
-function nodesForScopes(snapshot: Snapshot, scopeIds: string[]) {
-  if (!scopeIds.length) return null;
-
-  const nodesById = new Map(snapshot.nodes.map((node) => [node.id, node]));
-  const selectedScopes = new Set(scopeIds);
-  const components = new Set<string>();
-  const kpis = new Set<string>();
-  const agents = new Set<string>();
-  const links = new Set<string>();
-
-  const connectsTypes = (edge: GraphRelation, left: Set<string>, rightType: NodeType) => {
-    if (left.has(edge.source) && nodesById.get(edge.target)?.type === rightType) return edge.target;
-    if (left.has(edge.target) && nodesById.get(edge.source)?.type === rightType) return edge.source;
-    return null;
-  };
-
-  snapshot.relations
-    .filter((edge) => edge.type === "hasComponent" || edge.type === "isComponentOf")
-    .forEach((edge) => {
-      const componentId = connectsTypes(edge, selectedScopes, "Component");
-      if (componentId) components.add(componentId);
-    });
-
-  // Components nested below a component of the scope belong to the same view.
-  let addedComponent = true;
-  while (addedComponent) {
-    addedComponent = false;
-    snapshot.relations
-      .filter((edge) => edge.type === "hasSubcomponent" || edge.type === "hasSupercomponent")
-      .forEach((edge) => {
-        const source = nodesById.get(edge.source);
-        const target = nodesById.get(edge.target);
-        if (source?.type !== "Component" || target?.type !== "Component") return;
-        const parentId = edge.type === "hasSubcomponent" ? edge.source : edge.target;
-        const childId = edge.type === "hasSubcomponent" ? edge.target : edge.source;
-        if (components.has(parentId) && !components.has(childId)) {
-          components.add(childId);
-          addedComponent = true;
-        }
-      });
-  }
-
-  snapshot.relations
-    .filter((edge) => edge.type === "hasKPI" || edge.type === "appliesToComponent")
-    .forEach((edge) => {
-      const kpiId = connectsTypes(edge, components, "KPI");
-      if (kpiId) kpis.add(kpiId);
-    });
-
-  snapshot.relations
-    .filter((edge) => edge.type === "appliesToAgent" || edge.type === "hasAssociatedKPI")
-    .forEach((edge) => {
-      if (kpis.has(edge.source) && agentTypes.has(nodesById.get(edge.target)?.type as NodeType)) agents.add(edge.target);
-      if (kpis.has(edge.target) && agentTypes.has(nodesById.get(edge.source)?.type as NodeType)) agents.add(edge.source);
-    });
-
-  snapshot.relations
-    .filter((edge) => ["belongsTo", "participatesInValueChainLink", "hasPrincipalAgent", "hasParticipatingAgent"].includes(edge.type))
-    .forEach((edge) => {
-      const linkId = connectsTypes(edge, agents, "ValueChainLink");
-      if (linkId) links.add(linkId);
-    });
-
-  return new Set([...selectedScopes, ...components, ...kpis, ...agents, ...links]);
-}
+const emptyFilters: Filters = { user: [], type: [], node: [] };
 
 function filterGraph(snapshot: Snapshot, filters: Filters): Snapshot {
-  const scopeView = nodesForScopes(snapshot, filters.scope);
   const focus = new Set<string>();
   filters.node.forEach((nodeId) => {
     focus.add(nodeId);
@@ -284,7 +241,6 @@ function filterGraph(snapshot: Snapshot, filters: Filters): Snapshot {
     });
   });
   const nodes = snapshot.nodes.filter((node) =>
-    (!scopeView || scopeView.has(node.id)) &&
     (!filters.user.length || filters.user.includes(node.owner_id ?? "global")) &&
     (!filters.type.length || filters.type.includes(node.type)) &&
     (!filters.node.length || focus.has(node.id))
@@ -397,6 +353,7 @@ function Login({ onLogin }: { onLogin: (user: User) => void }) {
           </button>
         </form>
         <img src="/skai-logo.png" alt="SKAI Research Group" />
+        <a className="login-repository-link" href="https://github.com/skai-upm/fiap-orca-graph" target="_blank" rel="noopener noreferrer"><Github /> Código fuente en GitHub</a>
       </section>
     </main>
   );
@@ -405,11 +362,13 @@ function Login({ onLogin }: { onLogin: (user: User) => void }) {
 function GraphCanvas({
   snapshot,
   selected,
-  onSelect
+  onSelect,
+  onExpand
 }: {
   snapshot: Snapshot;
   selected: string | null;
   onSelect: (id: string | null) => void;
+  onExpand?: (id: string) => void;
 }) {
   const container = useRef<HTMLDivElement>(null);
   const instance = useRef<Core | null>(null);
@@ -442,6 +401,8 @@ function GraphCanvas({
     const dimensions: Record<NodeType, [number, number]> = {
       Scope: [136, 88],
       Component: [130, 84],
+      Subcomponent: [126, 82],
+      Element: [116, 76],
       KPI: [120, 120],
       ValueChain: [124, 124],
       ValueChainLink: [140, 88],
@@ -456,8 +417,10 @@ function GraphCanvas({
       AuxiliaryAgent: 2,
       SupportAgent: 2,
       KPI: 3,
-      Component: 4,
-      Scope: 5
+      Element: 4,
+      Subcomponent: 5,
+      Component: 6,
+      Scope: 7
     };
     const layerCounts = new Map<number, number>();
     snapshot.nodes.forEach((node) => {
@@ -507,7 +470,8 @@ function GraphCanvas({
           const targetType = snapshot.nodes.find((node) => node.id === edge.target)?.type;
           const structural =
             (sourceType === "ValueChainLink" && targetType === "ValueChainLink") ||
-            (sourceType === "Component" && targetType === "Component");
+            ([sourceType, targetType].includes("Component") && [sourceType, targetType].includes("Subcomponent")) ||
+            ([sourceType, targetType].includes("Subcomponent") && [sourceType, targetType].includes("Element"));
           return {
             data: {
               id: `${edge.source}-${edge.type}-${edge.target}-${index}`,
@@ -541,6 +505,8 @@ function GraphCanvas({
         },
         { selector: 'node[type = "Scope"]', style: { shape: "rectangle", "background-color": "#b8e1e3", "border-color": "#4e86a6", color: "#16324a" } },
         { selector: 'node[type = "Component"]', style: { shape: "round-rectangle", "background-color": "#d6efe3", "border-color": "#4d9b78", color: "#163f34" } },
+        { selector: 'node[type = "Subcomponent"]', style: { shape: "round-rectangle", "background-color": "#e4f1d2", "border-color": "#7aa34e", color: "#354c20" } },
+        { selector: 'node[type = "Element"]', style: { shape: "round-rectangle", "background-color": "#f3ebcc", "border-color": "#b59a45", color: "#50451f" } },
         { selector: 'node[type = "KPI"]', style: { shape: "diamond", "background-color": "#cff2e3", "border-color": "#2f9d79", color: "#16324a", "text-max-width": "88px" } },
         { selector: 'node[type = "ValueChain"]', style: { shape: "ellipse", "background-color": "#9fdadd", "border-color": "#315a78", color: "#16324a", "text-max-width": "96px" } },
         { selector: 'node[type = "ValueChainLink"]', style: { shape: "ellipse", "background-color": "#d7eaf5", "border-color": "#4e7fa0", color: "#16324a", "text-max-width": "116px" } },
@@ -550,6 +516,8 @@ function GraphCanvas({
         { selector: "node[?editable]", style: { "border-width": 5 } },
         { selector: 'node[type = "Scope"][!editable]', style: { "background-color": "#e3f3f4", "border-color": "#b7d5dc" } },
         { selector: 'node[type = "Component"][!editable]', style: { "background-color": "#edf8f2", "border-color": "#bddfcf" } },
+        { selector: 'node[type = "Subcomponent"][!editable]', style: { "background-color": "#f3f8ea", "border-color": "#d4e2bd" } },
+        { selector: 'node[type = "Element"][!editable]', style: { "background-color": "#faf7e9", "border-color": "#e2d8b6" } },
         { selector: 'node[type = "KPI"][!editable]', style: { "background-color": "#e8f8f1", "border-color": "#b9decf" } },
         { selector: 'node[type = "ValueChain"][!editable]', style: { "background-color": "#dcf1f2", "border-color": "#b6d8da" } },
         { selector: 'node[type = "ValueChainLink"][!editable]', style: { "background-color": "#eff6fa", "border-color": "#c7dce8" } },
@@ -591,7 +559,18 @@ function GraphCanvas({
       instance.current.zoom(viewportMemory.current.zoom);
       instance.current.pan(viewportMemory.current.pan);
     }
-    instance.current.on("tap", "node", (event) => onSelect(event.target.id()));
+    let lastNodeTap: { id: string; at: number } | null = null;
+    instance.current.on("tap", "node", (event) => {
+      const nodeId = event.target.id();
+      const now = Date.now();
+      if (onExpand && lastNodeTap && lastNodeTap.id === nodeId && now - lastNodeTap.at <= 320) {
+        onExpand(nodeId);
+        lastNodeTap = null;
+      } else {
+        onSelect(nodeId);
+        lastNodeTap = { id: nodeId, at: now };
+      }
+    });
     instance.current.on("dragfree", "node", (event) => {
       positionMemory.current.set(event.target.id(), { ...event.target.position() });
     });
@@ -610,7 +589,7 @@ function GraphCanvas({
       });
       instance.current?.destroy();
     };
-  }, [snapshot, onSelect]);
+  }, [snapshot, onSelect, onExpand]);
 
   useEffect(() => {
     if (!instance.current) return;
@@ -627,13 +606,19 @@ function creationTargets(type: NodeType, nodes: GraphNode[]) {
   }
   if (type === "Component") {
     return nodes
-      .filter((node) => node.type === "Scope" || node.type === "Component")
+      .filter((node) => node.type === "Scope")
       .map((node) => ({
         node,
-        relation: node.type === "Scope"
-          ? "hasComponent" as RelationType
-          : "hasSubcomponent" as RelationType
+        relation: "hasComponent" as RelationType
       }));
+  }
+  if (type === "Subcomponent") {
+    return nodes.filter((node) => node.type === "Component")
+      .map((node) => ({ node, relation: "hasSubcomponent" as RelationType }));
+  }
+  if (type === "Element") {
+    return nodes.filter((node) => node.type === "Subcomponent")
+      .map((node) => ({ node, relation: "hasElement" as RelationType }));
   }
   if (type === "ValueChainLink") {
     return nodes.filter((node) => node.type === "ValueChain")
@@ -649,10 +634,10 @@ function creationTargets(type: NodeType, nodes: GraphNode[]) {
   }
   if (type === "KPI") {
     return nodes
-      .filter((node) => ["Component", "PrincipalAgent", "AuxiliaryAgent", "SupportAgent"].includes(node.type))
+      .filter((node) => ["Component", "Subcomponent", "Element", "PrincipalAgent", "AuxiliaryAgent", "SupportAgent"].includes(node.type))
       .map((node) => ({
         node,
-        relation: node.type === "Component"
+        relation: ["Component", "Subcomponent", "Element"].includes(node.type)
           ? "appliesToComponent" as RelationType
           : "appliesToAgent" as RelationType
       }));
@@ -735,6 +720,9 @@ function NodeDialog({
   canManageValueChain,
   canManageRestrictedAgents,
   activeChainId,
+  users,
+  teams,
+  canSharePermissions,
   onClose,
   onCreated
 }: {
@@ -745,6 +733,9 @@ function NodeDialog({
   canManageValueChain: boolean;
   canManageRestrictedAgents: boolean;
   activeChainId: string | null;
+  users: User[];
+  teams: Team[];
+  canSharePermissions: boolean;
   onClose: () => void;
   onCreated: () => Promise<void>;
 }) {
@@ -753,7 +744,7 @@ function NodeDialog({
   const editing = Boolean(initialNode);
   const [name, setName] = useState(initialNode?.name ?? "");
   const [description, setDescription] = useState(initialNode?.description ?? "");
-  const [identification, setIdentification] = useState(initialNode?.identification ?? "");
+  const [code, setCode] = useState(initialNode?.code ?? (initialType === "KPI" ? crypto.randomUUID() : ""));
   const [evaluation, setEvaluation] = useState(initialNode?.evaluation ?? "");
   const [supportAgentSubtype, setSupportAgentSubtype] =
     useState<SupportAgentSubtype>(initialNode?.support_agent_subtype ?? "SupportAgent");
@@ -766,8 +757,14 @@ function NodeDialog({
   const canonicalComponentHierarchy = (edge: Pick<GraphRelation, "source" | "target" | "type">) =>
     edge.type === "hasSubcomponent"
       ? { superId: edge.source, subId: edge.target }
-      : edge.type === "hasSupercomponent"
+      : edge.type === "isSubcomponentOf"
         ? { superId: edge.target, subId: edge.source }
+        : null;
+  const canonicalElementHierarchy = (edge: Pick<GraphRelation, "source" | "target" | "type">) =>
+    edge.type === "hasElement"
+      ? { subId: edge.source, elementId: edge.target }
+      : edge.type === "isElementOf"
+        ? { subId: edge.target, elementId: edge.source }
         : null;
   const canonicalComponentKpi = (edge: Pick<GraphRelation, "source" | "target" | "type">) =>
     edge.type === "hasKPI"
@@ -797,7 +794,7 @@ function NodeDialog({
       : []
   );
   const [scopeIds, setScopeIds] = useState<string[]>(
-    initialNode?.type === "Component"
+    initialNode?.type === "Subcomponent"
       ? unique(relations.map(canonicalScopeComponent).filter((item) => item?.componentId === initialNode.id).map((item) => item!.scopeId))
       : []
   );
@@ -811,8 +808,18 @@ function NodeDialog({
       ? unique(relations.map(canonicalComponentHierarchy).filter((item) => item?.superId === initialNode.id).map((item) => item!.subId))
       : []
   );
+  const [parentSubcomponentIds, setParentSubcomponentIds] = useState<string[]>(
+    initialNode?.type === "Element"
+      ? unique(relations.map(canonicalElementHierarchy).filter((item) => item?.elementId === initialNode.id).map((item) => item!.subId))
+      : []
+  );
+  const [elementIds, setElementIds] = useState<string[]>(
+    initialNode?.type === "Subcomponent"
+      ? unique(relations.map(canonicalElementHierarchy).filter((item) => item?.subId === initialNode.id).map((item) => item!.elementId))
+      : []
+  );
   const [componentKpiIds, setComponentKpiIds] = useState<string[]>(
-    initialNode?.type === "Component"
+    initialNode && ["Component", "Subcomponent", "Element"].includes(initialNode.type)
       ? unique(relations.map(canonicalComponentKpi).filter((item) => item?.componentId === initialNode.id).map((item) => item!.kpiId))
       : []
   );
@@ -856,6 +863,15 @@ function NodeDialog({
       ? unique(relations.map(canonicalAgentKpi).filter((item) => item?.kpiId === initialNode.id).map((item) => item!.agentId))
       : []
   );
+  const [shareUserIds, setShareUserIds] = useState<string[]>([]);
+  const [shareTeamIds, setShareTeamIds] = useState<string[]>([]);
+  useEffect(() => {
+    if (type !== "ValueChain" || !initialNode || !canSharePermissions) return;
+    api.nodePermissions(initialNode.id).then(items => {
+      setShareUserIds(items.filter(item => item.target_type === "user").map(item => item.target_id));
+      setShareTeamIds(items.filter(item => item.target_type === "team").map(item => item.target_id));
+    }).catch(reason => setError(reason instanceof Error ? reason.message : "No se pudieron cargar los permisos"));
+  }, [type, initialNode, canSharePermissions]);
   const [error, setError] = useState("");
   const isAgent = ["PrincipalAgent", "AuxiliaryAgent", "SupportAgent"].includes(type);
   const links = nodes.filter((node) => node.type === "ValueChainLink" && node.id !== initialNode?.id);
@@ -871,6 +887,9 @@ function NodeDialog({
   const relatedLinkOptions = links.filter((link) => !chainId || chainForLink.get(link.id) === chainId);
   const scopes = nodes.filter((node) => node.type === "Scope");
   const components = nodes.filter((node) => node.type === "Component" && node.id !== initialNode?.id);
+  const subcomponents = nodes.filter((node) => node.type === "Subcomponent" && node.id !== initialNode?.id);
+  const elements = nodes.filter((node) => node.type === "Element" && node.id !== initialNode?.id);
+  const componentLevels = [...components, ...subcomponents, ...elements];
   const kpis = nodes.filter((node) => node.type === "KPI");
   const agents = nodes.filter((node) => ["PrincipalAgent", "AuxiliaryAgent", "SupportAgent"].includes(node.type));
   const targets = creationTargets(type, nodes);
@@ -882,7 +901,7 @@ function NodeDialog({
     const payload: NodePayload = { type, name, description };
     if (type !== "ValueChain" && activeChainId) payload.chain_id = activeChainId;
     if (type === "KPI") {
-      payload.identification = identification;
+      payload.code = code;
       payload.evaluation = evaluation;
     }
     if (type === "SupportAgent") {
@@ -897,12 +916,12 @@ function NodeDialog({
     if (!editing && type === "ValueChainLink" && chainId) {
       payload.parent = { parent_id: chainId, relation: "hasValueChainLink" };
     }
-    if (!editing && type === "Component") {
-      const parentId = scopeIds[0] ?? supercomponentIds[0];
+    if (!editing && ["Component", "Subcomponent", "Element"].includes(type)) {
+      const parentId = type === "Component" ? scopeIds[0] : type === "Subcomponent" ? supercomponentIds[0] : parentSubcomponentIds[0];
       if (parentId) {
         payload.parent = {
           parent_id: parentId,
-          relation: scopeIds.length ? "hasComponent" : "hasSubcomponent"
+          relation: type === "Component" ? "hasComponent" : type === "Subcomponent" ? "hasSubcomponent" : "hasElement"
         };
       }
     }
@@ -910,6 +929,12 @@ function NodeDialog({
       if (initialNode) {
         const { type: _type, parent: _parent, chain_id: _chainId, ...changes } = payload;
         await api.updateNode(initialNode.id, changes);
+        if (type === "ValueChain" && canSharePermissions) {
+          await api.updateNodePermissions(initialNode.id, [
+            ...shareUserIds.map(target_id => ({ target_type: "user" as const, target_id })),
+            ...shareTeamIds.map(target_id => ({ target_type: "team" as const, target_id }))
+          ]);
+        }
         const desired: { source: string; target: string; type: RelationType }[] = [];
         if (type === "ValueChain") {
           chainLinkIds.forEach((id) => desired.push({ source: initialNode.id, target: id, type: "hasValueChainLink" }));
@@ -923,8 +948,16 @@ function NodeDialog({
         }
         if (type === "Component") {
           scopeIds.forEach((id) => desired.push({ source: id, target: initialNode.id, type: "hasComponent" }));
-          supercomponentIds.forEach((id) => desired.push({ source: id, target: initialNode.id, type: "hasSubcomponent" }));
           subcomponentIds.forEach((id) => desired.push({ source: initialNode.id, target: id, type: "hasSubcomponent" }));
+          componentKpiIds.forEach((id) => desired.push({ source: initialNode.id, target: id, type: "hasKPI" }));
+        }
+        if (type === "Subcomponent") {
+          supercomponentIds.forEach((id) => desired.push({ source: id, target: initialNode.id, type: "hasSubcomponent" }));
+          elementIds.forEach((id) => desired.push({ source: initialNode.id, target: id, type: "hasElement" }));
+          componentKpiIds.forEach((id) => desired.push({ source: initialNode.id, target: id, type: "hasKPI" }));
+        }
+        if (type === "Element") {
+          parentSubcomponentIds.forEach((id) => desired.push({ source: id, target: initialNode.id, type: "hasElement" }));
           componentKpiIds.forEach((id) => desired.push({ source: initialNode.id, target: id, type: "hasKPI" }));
         }
         if (isAgent) {
@@ -939,11 +972,12 @@ function NodeDialog({
           kpiComponentIds.forEach((id) => desired.push({ source: initialNode.id, target: id, type: "appliesToComponent" }));
           kpiAgentIds.forEach((id) => desired.push({ source: initialNode.id, target: id, type: "appliesToAgent" }));
         }
-        if (["ValueChain", "ValueChainLink", "Scope", "Component", "KPI"].includes(type) || isAgent) {
+        if (["ValueChain", "ValueChainLink", "Scope", "Component", "Subcomponent", "Element", "KPI"].includes(type) || isAgent) {
           const relevant = (edge: GraphRelation) => {
             const item = membership(edge);
             const scopeComponent = canonicalScopeComponent(edge);
             const hierarchy = canonicalComponentHierarchy(edge);
+            const elementHierarchy = canonicalElementHierarchy(edge);
             const componentKpi = canonicalComponentKpi(edge);
             return (
               (type === "ValueChain" && item?.chainId === initialNode.id) ||
@@ -953,9 +987,10 @@ function NodeDialog({
               (type === "Component" && (
                 scopeComponent?.componentId === initialNode.id ||
                 hierarchy?.superId === initialNode.id ||
-                hierarchy?.subId === initialNode.id ||
                 componentKpi?.componentId === initialNode.id
               )) ||
+              (type === "Subcomponent" && (hierarchy?.subId === initialNode.id || elementHierarchy?.subId === initialNode.id || componentKpi?.componentId === initialNode.id)) ||
+              (type === "Element" && (elementHierarchy?.elementId === initialNode.id || componentKpi?.componentId === initialNode.id)) ||
               (isAgent && (
                 canonicalAgentLink(edge)?.agentId === initialNode.id ||
                 canonicalAgentKpi(edge)?.agentId === initialNode.id
@@ -972,12 +1007,14 @@ function NodeDialog({
             const item = membership(edge);
             const scopeComponent = canonicalScopeComponent(edge);
             const hierarchy = canonicalComponentHierarchy(edge);
+            const elementHierarchy = canonicalElementHierarchy(edge);
             const componentKpi = canonicalComponentKpi(edge);
             const agentLink = canonicalAgentLink(edge);
             const agentKpi = canonicalAgentKpi(edge);
             if (item) return `${item.chainId}|${item.linkId}|membership`;
             if (scopeComponent) return `${scopeComponent.scopeId}|${scopeComponent.componentId}|scope-component`;
             if (hierarchy) return `${hierarchy.superId}|${hierarchy.subId}|component-hierarchy`;
+            if (elementHierarchy) return `${elementHierarchy.subId}|${elementHierarchy.elementId}|element-hierarchy`;
             if (componentKpi) return `${componentKpi.componentId}|${componentKpi.kpiId}|component-kpi`;
             if (agentLink) return `${agentLink.agentId}|${agentLink.linkId}|agent-link`;
             if (agentKpi) return `${agentKpi.agentId}|${agentKpi.kpiId}|agent-kpi`;
@@ -998,6 +1035,12 @@ function NodeDialog({
         }
       } else {
         const created = await api.createNode(payload);
+        if (type === "ValueChain" && canSharePermissions) {
+          await api.updateNodePermissions(created.id, [
+            ...shareUserIds.map(target_id => ({ target_type: "user" as const, target_id })),
+            ...shareTeamIds.map(target_id => ({ target_type: "team" as const, target_id }))
+          ]);
+        }
         const relations: { source: string; target: string; type: RelationType }[] = [];
         if (type === "ValueChain") {
           chainLinkIds.forEach((id) => relations.push({ source: created.id, target: id, type: "hasValueChainLink" }));
@@ -1010,6 +1053,9 @@ function NodeDialog({
         supercomponentIds.slice(payload.parent?.relation === "hasSubcomponent" ? 1 : 0)
           .forEach((id) => relations.push({ source: id, target: created.id, type: "hasSubcomponent" }));
         subcomponentIds.forEach((id) => relations.push({ source: created.id, target: id, type: "hasSubcomponent" }));
+        parentSubcomponentIds.slice(payload.parent?.relation === "hasElement" ? 1 : 0)
+          .forEach((id) => relations.push({ source: id, target: created.id, type: "hasElement" }));
+        elementIds.forEach((id) => relations.push({ source: created.id, target: id, type: "hasElement" }));
         componentKpiIds.forEach((id) => relations.push({ source: created.id, target: id, type: "hasKPI" }));
         linkRelations.filter((item) => item.targetId).forEach((item) => relations.push({ source: created.id, target: item.targetId, type: item.type }));
         relatedLinkIds.slice(payload.parent ? 1 : 0).forEach((id) => relations.push({
@@ -1043,15 +1089,15 @@ function NodeDialog({
         </div>
         <label htmlFor="new-name">Nombre</label>
         <input id="new-name" required maxLength={200} value={name} onChange={(e) => setName(e.target.value)} />
-        {type === "Scope" || type === "Component" || type === "ValueChain" || type === "ValueChainLink" ? (
+        {type === "Scope" || type === "Component" || type === "Subcomponent" || type === "Element" || type === "ValueChain" || type === "ValueChainLink" ? (
           <>
             <label htmlFor="new-description">Descripción</label>
             <textarea id="new-description" required value={description} onChange={(e) => setDescription(e.target.value)} />
           </>
         ) : type === "KPI" ? (
           <>
-            <label htmlFor="new-identification">Identificación</label>
-            <textarea id="new-identification" required maxLength={2000} value={identification} onChange={(e) => setIdentification(e.target.value)} />
+            <label htmlFor="new-code">Código</label>
+            <input id="new-code" required maxLength={2000} value={code} onChange={(e) => setCode(e.target.value)} />
             <label htmlFor="new-description">Descripción</label>
             <textarea id="new-description" required maxLength={2000} value={description} onChange={(e) => setDescription(e.target.value)} />
             <label htmlFor="new-evaluation">Evaluación</label>
@@ -1092,12 +1138,27 @@ function NodeDialog({
         )}
         {type === "Component" && <>
           <MultiNodeSelect label="Ámbitos" options={scopes} selected={scopeIds} onChange={setScopeIds} placeholder="Buscar y añadir ámbitos..." />
-          <MultiNodeSelect label="Supercomponentes" options={components} selected={supercomponentIds} onChange={setSupercomponentIds} placeholder="Buscar y añadir supercomponentes..." />
-          <MultiNodeSelect label="Subcomponentes" options={components} selected={subcomponentIds} onChange={setSubcomponentIds} placeholder="Buscar y añadir subcomponentes..." />
+          <MultiNodeSelect label="Subcomponentes" options={subcomponents} selected={subcomponentIds} onChange={setSubcomponentIds} placeholder="Buscar y añadir subcomponentes..." />
+          <MultiNodeSelect label="KPI" options={kpis} selected={componentKpiIds} onChange={setComponentKpiIds} placeholder="Buscar y añadir KPI..." />
+        </>}
+        {type === "Subcomponent" && <>
+          <MultiNodeSelect label="Componentes" options={components} selected={supercomponentIds} onChange={setSupercomponentIds} placeholder="Buscar y añadir componentes..." />
+          <MultiNodeSelect label="Elementos" options={elements} selected={elementIds} onChange={setElementIds} placeholder="Buscar y añadir elementos..." />
+          <MultiNodeSelect label="KPI" options={kpis} selected={componentKpiIds} onChange={setComponentKpiIds} placeholder="Buscar y añadir KPI..." />
+        </>}
+        {type === "Element" && <>
+          <MultiNodeSelect label="Subcomponentes" options={subcomponents} selected={parentSubcomponentIds} onChange={setParentSubcomponentIds} placeholder="Buscar y añadir subcomponentes..." />
           <MultiNodeSelect label="KPI" options={kpis} selected={componentKpiIds} onChange={setComponentKpiIds} placeholder="Buscar y añadir KPI..." />
         </>}
         {type === "ValueChain" && (
-          <MultiNodeSelect label="Eslabones de la cadena" options={selectableChainLinks} selected={chainLinkIds} onChange={setChainLinkIds} placeholder="Buscar y añadir varios eslabones..." />
+          <>
+            <MultiNodeSelect label="Eslabones de la cadena" options={selectableChainLinks} selected={chainLinkIds} onChange={setChainLinkIds} placeholder="Buscar y añadir varios eslabones..." />
+            {canSharePermissions && <>
+              <MultiFilterSelect label="Usuarios con acceso" options={users.filter(person => person.id !== initialNode?.owner_id).map(person => ({ value: person.id, label: person.display_name, detail: `@${person.username} · ${roleLabels[person.role]}` }))} selected={shareUserIds} onChange={setShareUserIds} placeholder="Buscar y añadir usuarios…" />
+              <MultiFilterSelect label="Equipos con acceso" options={teams.map(team => ({ value: team.id, label: team.name, detail: `${team.member_ids.length} miembros` }))} selected={shareTeamIds} onChange={setShareTeamIds} placeholder="Buscar y añadir equipos…" />
+              <div className="permission-note">Estos permisos se aplicarán a todos los nodos actuales y futuros de la cadena, respetando las capacidades de cada rol.</div>
+            </>}
+          </>
         )}
         {type === "ValueChainLink" && <>
           <div className="active-chain-form-note"><strong>Cadena activa</strong><span>{chains.find((chain) => chain.id === chainId)?.name ?? "Sin cadena activa"}</span></div>
@@ -1125,7 +1186,7 @@ function NodeDialog({
           <MultiNodeSelect label="KPI asociados" options={kpis} selected={agentKpiIds} onChange={setAgentKpiIds} placeholder="Buscar y añadir KPI..." />
         )}
         {type === "KPI" && <>
-          <MultiNodeSelect label="Componentes" options={components} selected={kpiComponentIds} onChange={setKpiComponentIds} placeholder="Buscar y añadir componentes..." />
+          <MultiNodeSelect label="Componentes, subcomponentes y elementos" options={componentLevels} selected={kpiComponentIds} onChange={setKpiComponentIds} placeholder="Buscar y añadir niveles..." />
           <MultiNodeSelect label="Agentes" options={agents} selected={kpiAgentIds} onChange={setKpiAgentIds} placeholder="Buscar y añadir agentes..." />
         </>}
         {error && <div className="error">{error}</div>}
@@ -1398,7 +1459,152 @@ function UserAdminDialog({
   );
 }
 
-type DataSection = "Definitions" | "ValueChain" | "ValueChainLink" | "Scope" | "Component" | "Agent" | "KPI";
+function TeamsDialog({ user, users, teams, onClose, onChanged }: {
+  user: User; users: User[]; teams: Team[]; onClose: () => void; onChanged: () => Promise<void>;
+}) {
+  const canManage = hasSpecialPermissions(user);
+  const [editing, setEditing] = useState<Team | null>(null);
+  const [name, setName] = useState("");
+  const [members, setMembers] = useState<string[]>([]);
+  const [error, setError] = useState("");
+  const select = (team?: Team) => {
+    setEditing(team ?? null); setName(team?.name ?? ""); setMembers(team?.member_ids ?? []); setError("");
+  };
+  async function save(event: FormEvent) {
+    event.preventDefault();
+    try {
+      if (editing) await api.updateTeam(editing.id, { name, member_ids: members });
+      else await api.createTeam({ name, member_ids: members });
+      select(); await onChanged();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "No se pudo guardar el equipo"); }
+  }
+  async function remove(team: Team) {
+    if (!window.confirm(`¿Eliminar el equipo «${team.name}»?`)) return;
+    try { await api.deleteTeam(team.id); await onChanged(); } catch (reason) { setError(reason instanceof Error ? reason.message : "No se pudo eliminar"); }
+  }
+  async function leave(team: Team) {
+    if (!window.confirm(`¿Darte de baja del equipo «${team.name}»?`)) return;
+    try { await api.leaveTeam(team.id); await onChanged(); } catch (reason) { setError(reason instanceof Error ? reason.message : "No se pudo abandonar el equipo"); }
+  }
+  return <div className="overlay" onMouseDown={(event: MouseEvent<HTMLDivElement>) => { if (event.target === event.currentTarget) onClose(); }}>
+    <section className="dialog user-admin-dialog">
+      <div className="dialog-title"><div><strong>Equipos</strong><span>{canManage ? "Crea equipos y gestiona sus miembros." : "Consulta tus equipos o date de baja."}</span></div><button className="icon" onClick={onClose}><X /></button></div>
+      {canManage && <form className="team-form" onSubmit={save}>
+        <label>Nombre del equipo<input required value={name} onChange={(e) => setName(e.target.value)} /></label>
+        <MultiFilterSelect label="Miembros" options={users.map(person => ({ value: person.id, label: person.display_name, detail: `@${person.username} · ${roleLabels[person.role]}` }))} selected={members} onChange={setMembers} placeholder="Buscar y añadir usuarios…" />
+        <div className="dialog-actions"><button className="primary"><Users /> {editing ? "Guardar equipo" : "Crear equipo"}</button>{editing && <button type="button" className="secondary" onClick={() => select()}>Cancelar</button>}</div>
+      </form>}
+      {error && <div className="error">{error}</div>}
+      <div className="user-admin-list">{teams.map(team => <div className="user-admin-row team-row" key={team.id}><b>{team.name.slice(0,2).toUpperCase()}</b><span><strong>{team.name}</strong><small>{team.member_ids.length} miembros · {team.member_ids.map(id => users.find(item => item.id === id)?.display_name).filter(Boolean).join(", ") || "Sin miembros"}</small></span><div className="team-row-actions">{canManage ? <><button className="table-action" onClick={() => select(team)}><Pencil /> Editar</button><button className="table-action danger-action" onClick={() => remove(team)}><Trash2 /> Borrar</button></> : <button className="table-action danger-action leave-team-action" onClick={() => leave(team)}>Darme de baja</button>}</div></div>)}</div>
+      <div className="dialog-actions"><button className="secondary" onClick={onClose}>Cerrar</button></div>
+    </section>
+  </div>;
+}
+
+function PermissionsDialog({ node, users, teams, onClose, onChanged }: {
+  node: GraphNode; users: User[]; teams: Team[]; onClose: () => void; onChanged: () => Promise<void>;
+}) {
+  const [grants, setGrants] = useState<NodePermissionGrant[]>([]);
+  const [error, setError] = useState("");
+  useEffect(() => { api.nodePermissions(node.id).then(setGrants).catch(reason => setError(reason.message)); }, [node.id]);
+  const selectedUsers = grants.filter(item => item.target_type === "user").map(item => item.target_id);
+  const selectedTeams = grants.filter(item => item.target_type === "team").map(item => item.target_id);
+  const setTargets = (target_type: "user" | "team", ids: string[]) =>
+    setGrants(current => [...current.filter(item => item.target_type !== target_type), ...ids.map(target_id => ({ target_type, target_id }))]);
+  async function save() {
+    try { await api.updateNodePermissions(node.id, grants); await onChanged(); onClose(); } catch (reason) { setError(reason instanceof Error ? reason.message : "No se pudieron guardar los permisos"); }
+  }
+  return <div className="overlay" onMouseDown={(event: MouseEvent<HTMLDivElement>) => { if (event.target === event.currentTarget) onClose(); }}><section className="dialog permission-dialog">
+    <div className="dialog-title"><div><strong>Compartir «{node.name}»</strong><span>{node.type === "ValueChain" ? "El permiso se aplicará a todos los nodos actuales y futuros de la cadena." : "Los seleccionados podrán editar y borrar este nodo según las capacidades de su rol."}</span></div><button className="icon" onClick={onClose}><X /></button></div>
+    <MultiFilterSelect label="Usuarios" options={users.filter(item => item.id !== node.owner_id).map(person => ({ value: person.id, label: person.display_name, detail: `@${person.username} · ${roleLabels[person.role]}` }))} selected={selectedUsers} onChange={ids => setTargets("user", ids)} placeholder="Buscar y añadir usuarios…" />
+    <MultiFilterSelect label="Equipos" options={teams.map(team => ({ value: team.id, label: team.name, detail: `${team.member_ids.length} miembros` }))} selected={selectedTeams} onChange={ids => setTargets("team", ids)} placeholder="Buscar y añadir equipos…" />
+    <div className="permission-note">Los usuarios normales podrán modificar Ámbitos, Componentes, Subcomponentes, Elementos y KPI. Los usuarios especiales y administradores podrán modificar también cadenas, eslabones y agentes.</div>
+    {error && <div className="error">{error}</div>}<div className="dialog-actions"><button className="secondary" onClick={onClose}>Cancelar</button><button className="primary" onClick={save}>Guardar permisos</button></div>
+  </section></div>;
+}
+
+function DefinitionPermissionsDialog({ concept, users, teams, onClose, onChanged }: {
+  concept: OntologyConcept; users: User[]; teams: Team[]; onClose: () => void; onChanged: () => Promise<void>;
+}) {
+  const [grants, setGrants] = useState<NodePermissionGrant[]>([]);
+  const [error, setError] = useState("");
+  useEffect(() => { api.conceptPermissions(concept.iri).then(setGrants).catch(reason => setError(reason.message)); }, [concept.iri]);
+  const selectedUsers = grants.filter(item => item.target_type === "user").map(item => item.target_id);
+  const selectedTeams = grants.filter(item => item.target_type === "team").map(item => item.target_id);
+  const setTargets = (target_type: "user" | "team", ids: string[]) =>
+    setGrants(current => [...current.filter(item => item.target_type !== target_type), ...ids.map(target_id => ({ target_type, target_id }))]);
+  async function save() {
+    try {
+      await api.updateConceptPermissions(concept.iri, grants);
+      await onChanged();
+      onClose();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "No se pudieron guardar los permisos");
+    }
+  }
+  return <div className="overlay" onMouseDown={(event: MouseEvent<HTMLDivElement>) => { if (event.target === event.currentTarget) onClose(); }}>
+    <section className="dialog permission-dialog">
+      <div className="dialog-title"><div><strong>Compartir «{concept.label}»</strong><span>Los destinatarios podrán editar y borrar esta definición.</span></div><button className="icon" onClick={onClose}><X /></button></div>
+      <MultiFilterSelect label="Usuarios" options={users.map(person => ({ value: person.id, label: person.display_name, detail: `@${person.username} · ${roleLabels[person.role]}` }))} selected={selectedUsers} onChange={ids => setTargets("user", ids)} placeholder="Buscar y añadir usuarios…" />
+      <MultiFilterSelect label="Equipos" options={teams.map(team => ({ value: team.id, label: team.name, detail: `${team.member_ids.length} miembros` }))} selected={selectedTeams} onChange={ids => setTargets("team", ids)} placeholder="Buscar y añadir equipos…" />
+      <div className="permission-note">La autorización concede los mismos derechos de edición y borrado sobre esta definición.</div>
+      {error && <div className="error">{error}</div>}
+      <div className="dialog-actions"><button className="secondary" onClick={onClose}>Cancelar</button><button className="primary" onClick={save}>Guardar permisos</button></div>
+    </section>
+  </div>;
+}
+
+function BulkPermissionsDialog({ kind, items, user, users, teams, onClose, onChanged }: {
+  kind: "definitions" | "nodes";
+  items: { id: string; label: string; detail?: string }[];
+  user: User;
+  users: User[];
+  teams: Team[];
+  onClose: () => void;
+  onChanged: () => Promise<void>;
+}) {
+  const [resourceIds, setResourceIds] = useState<string[]>(items.map(item => item.id));
+  const [grants, setGrants] = useState<NodePermissionGrant[]>([]);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [resourceQuery, setResourceQuery] = useState("");
+  const selectedUsers = grants.filter(item => item.target_type === "user").map(item => item.target_id);
+  const selectedTeams = grants.filter(item => item.target_type === "team").map(item => item.target_id);
+  const setTargets = (target_type: "user" | "team", ids: string[]) =>
+    setGrants(current => [...current.filter(item => item.target_type !== target_type), ...ids.map(target_id => ({ target_type, target_id }))]);
+  const toggleResource = (id: string) => setResourceIds(current => current.includes(id) ? current.filter(item => item !== id) : [...current, id]);
+  const filteredItems = items.filter(item => `${item.label} ${item.detail ?? ""}`.toLocaleLowerCase("es").includes(resourceQuery.toLocaleLowerCase("es")));
+  async function save() {
+    setSaving(true); setError("");
+    try {
+      if (kind === "definitions") await api.addBulkConceptPermissions(resourceIds, grants);
+      else await api.addBulkNodePermissions(resourceIds, grants);
+      await onChanged(); onClose();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "No se pudieron aplicar los permisos");
+    } finally { setSaving(false); }
+  }
+  return <div className="overlay" onMouseDown={(event: MouseEvent<HTMLDivElement>) => { if (event.target === event.currentTarget && !saving) onClose(); }}>
+    <section className="dialog permission-dialog bulk-permission-dialog">
+      <div className="dialog-title"><div><strong>Compartir {kind === "definitions" ? "definiciones" : "elementos"} en bloque</strong><span>Los permisos se añadirán sin eliminar los que ya tenga cada elemento.</span></div><button className="icon" disabled={saving} onClick={onClose}><X /></button></div>
+      <fieldset className="bulk-resource-fieldset"><legend>Selecciona los elementos</legend>
+        <div className="bulk-resource-summary"><span><strong>{resourceIds.length}</strong> de {items.length} seleccionados</span><div className="bulk-select-actions"><button type="button" onClick={() => setResourceIds(items.map(item => item.id))}>Todos</button><button type="button" onClick={() => setResourceIds([])}>Ninguno</button></div></div>
+        <div className="bulk-resource-search"><Search /><input value={resourceQuery} onChange={event => setResourceQuery(event.target.value)} placeholder="Filtrar elementos por nombre…" /></div>
+        <div className="bulk-resource-list">{filteredItems.map(item => {
+          const checked = resourceIds.includes(item.id);
+          return <label key={item.id} className={checked ? "selected" : ""}><input type="checkbox" checked={checked} onChange={() => toggleResource(item.id)} /><span className="bulk-check">{checked ? "✓" : ""}</span><span className="bulk-resource-copy"><strong>{item.label}</strong>{item.detail && <small>{item.detail}</small>}</span></label>;
+        })}</div>
+      </fieldset>
+      <MultiFilterSelect label="Usuarios" options={users.filter(person => person.id !== user.id).map(person => ({ value: person.id, label: person.display_name, detail: `@${person.username} · ${roleLabels[person.role]}` }))} selected={selectedUsers} onChange={ids => setTargets("user", ids)} placeholder="Buscar y añadir usuarios…" />
+      <MultiFilterSelect label="Equipos" options={teams.map(team => ({ value: team.id, label: team.name, detail: `${team.member_ids.length} miembros` }))} selected={selectedTeams} onChange={ids => setTargets("team", ids)} placeholder="Buscar y añadir equipos…" />
+      <div className="permission-note">Los permisos de rol continúan aplicándose: una cuenta normal solo puede modificar los tipos de nodo permitidos para su perfil.</div>
+      {error && <div className="error">{error}</div>}
+      <div className="dialog-actions"><button className="secondary" disabled={saving} onClick={onClose}>Cancelar</button><button className="primary" disabled={saving || !resourceIds.length || !grants.length} onClick={save}><Users /> {saving ? "Compartiendo…" : `Compartir ${resourceIds.length} elementos`}</button></div>
+    </section>
+  </div>;
+}
+
+type DataSection = "Definitions" | "ValueChain" | "ValueChainLink" | "Scope" | "Component" | "Subcomponent" | "Element" | "Agent" | "KPI";
 
 const dataSections: { id: DataSection; label: string }[] = [
   { id: "Definitions", label: "Definiciones" },
@@ -1407,6 +1613,8 @@ const dataSections: { id: DataSection; label: string }[] = [
   { id: "Agent", label: "Agente" },
   { id: "Scope", label: "Ámbito" },
   { id: "Component", label: "Componente" },
+  { id: "Subcomponent", label: "Subcomponente" },
+  { id: "Element", label: "Elemento" },
   { id: "KPI", label: "KPI" }
 ];
 
@@ -1420,7 +1628,10 @@ function DataWorkspace({
   onCreated,
   onCreateNode,
   onEditNode,
-  onDeleteNode
+  onDeleteNode,
+  onShareNode,
+  users,
+  teams
 }: {
   snapshot: Snapshot;
   globalSnapshot: Snapshot;
@@ -1432,6 +1643,9 @@ function DataWorkspace({
   onCreateNode: (type: NodeType) => void;
   onEditNode: (node: GraphNode) => void;
   onDeleteNode: (node: GraphNode) => void;
+  onShareNode: (node: GraphNode) => void;
+  users: User[];
+  teams: Team[];
 }) {
   const [section, setSection] = useState<DataSection>("Definitions");
   const [query, setQuery] = useState("");
@@ -1439,6 +1653,8 @@ function DataWorkspace({
   const [concepts, setConcepts] = useState<OntologyConcept[]>([]);
   const [conceptError, setConceptError] = useState("");
   const [editingConcept, setEditingConcept] = useState<OntologyConcept | null | undefined>(undefined);
+  const [sharingConcept, setSharingConcept] = useState<OntologyConcept | null>(null);
+  const [sharingBulk, setSharingBulk] = useState(false);
   const [conceptLabel, setConceptLabel] = useState("");
   const [conceptDefinition, setConceptDefinition] = useState("");
   const [savingConcept, setSavingConcept] = useState(false);
@@ -1458,7 +1674,7 @@ function DataWorkspace({
       ownership === "all" ||
       (ownership === "mine" ? node.owner_id === user.id : node.owner_id !== user.id);
     return inSection && ownerMatch &&
-      `${node.name} ${node.identification ?? ""} ${node.description} ${node.evaluation ?? ""} ${node.owner_name}`
+      `${node.name} ${node.code ?? ""} ${node.description} ${node.evaluation ?? ""} ${node.owner_name}`
         .toLowerCase().includes(query.toLowerCase());
   });
   const visibleConcepts = concepts
@@ -1467,6 +1683,9 @@ function DataWorkspace({
     )
     .sort((left, right) => left.label.localeCompare(right.label, "es", { sensitivity: "base" }));
   const count = section === "Definitions" ? visibleConcepts.length : nodes.length;
+  const bulkShareItems = section === "Definitions"
+    ? (hasSpecialPermissions(user) ? visibleConcepts.map(concept => ({ id: concept.iri, label: concept.label, detail: "Definición ontológica" })) : [])
+    : nodes.filter(node => node.owner_id === user.id).map(node => ({ id: node.id, label: node.name, detail: typeInfo[node.type].label }));
 
   const loadConcepts = useCallback(async () => {
     try {
@@ -1478,6 +1697,12 @@ function DataWorkspace({
   }, []);
 
   useEffect(() => { void loadConcepts(); }, [loadConcepts]);
+
+  const canEditSection = (item: DataSection) => {
+    if (item === "Definitions") return hasSpecialPermissions(user) || concepts.some(concept => concept.editable);
+    if (item === "ValueChain" || item === "ValueChainLink" || item === "Agent") return hasSpecialPermissions(user);
+    return true;
+  };
 
   function openConcept(concept: OntologyConcept | null) {
     setEditingConcept(concept);
@@ -1595,17 +1820,31 @@ function DataWorkspace({
       return [];
     })
   );
-  const supercomponentNames = (componentId: string) => namesForIds(
+  const parentComponentNames = (subcomponentId: string) => namesForIds(
     snapshot.relations.flatMap((edge) => {
-      if (edge.type === "hasSubcomponent" && edge.target === componentId) return [edge.source];
-      if (edge.type === "hasSupercomponent" && edge.source === componentId) return [edge.target];
+      if (edge.type === "hasSubcomponent" && edge.target === subcomponentId) return [edge.source];
+      if (edge.type === "isSubcomponentOf" && edge.source === subcomponentId) return [edge.target];
       return [];
     })
   );
   const subcomponentNames = (componentId: string) => namesForIds(
     snapshot.relations.flatMap((edge) => {
       if (edge.type === "hasSubcomponent" && edge.source === componentId) return [edge.target];
-      if (edge.type === "hasSupercomponent" && edge.target === componentId) return [edge.source];
+      if (edge.type === "isSubcomponentOf" && edge.target === componentId) return [edge.source];
+      return [];
+    })
+  );
+  const subcomponentElementNames = (subcomponentId: string) => namesForIds(
+    snapshot.relations.flatMap((edge) => {
+      if (edge.type === "hasElement" && edge.source === subcomponentId) return [edge.target];
+      if (edge.type === "isElementOf" && edge.target === subcomponentId) return [edge.source];
+      return [];
+    })
+  );
+  const elementSubcomponentNames = (elementId: string) => namesForIds(
+    snapshot.relations.flatMap((edge) => {
+      if (edge.type === "hasElement" && edge.target === elementId) return [edge.source];
+      if (edge.type === "isElementOf" && edge.source === elementId) return [edge.target];
       return [];
     })
   );
@@ -1665,6 +1904,8 @@ function DataWorkspace({
   const creationActions: { type: NodeType; label: string }[] =
     section === "Scope" ? [{ type: "Scope", label: "Crear ámbito" }] :
     section === "Component" ? [{ type: "Component", label: "Crear componente" }] :
+    section === "Subcomponent" ? [{ type: "Subcomponent", label: "Crear subcomponente" }] :
+    section === "Element" ? [{ type: "Element", label: "Crear elemento" }] :
     section === "KPI" ? [{ type: "KPI", label: "Crear KPI" }] :
     section === "Agent" && hasSpecialPermissions(user) ? [{ type: "PrincipalAgent", label: "Crear agente" }] :
     section === "ValueChain" && canManageValueChains(user) ? [{ type: "ValueChain", label: "Crear cadena" }] :
@@ -1711,8 +1952,28 @@ function DataWorkspace({
           Nombre: node.name,
           Descripción: node.description,
           Ámbitos: join(componentScopeNames(node.id)),
-          Supercomponentes: join(supercomponentNames(node.id)),
           Subcomponentes: join(subcomponentNames(node.id)),
+          KPI: join(componentKpiNames(node.id)),
+          Autor: node.owner_name
+        }))
+      },
+      {
+        name: "Subcomponentes",
+        rows: byType(["Subcomponent"]).map((node) => ({
+          Nombre: node.name,
+          Descripción: node.description,
+          Componentes: join(parentComponentNames(node.id)),
+          Elementos: join(subcomponentElementNames(node.id)),
+          KPI: join(componentKpiNames(node.id)),
+          Autor: node.owner_name
+        }))
+      },
+      {
+        name: "Elementos",
+        rows: byType(["Element"]).map((node) => ({
+          Nombre: node.name,
+          Descripción: node.description,
+          Subcomponentes: join(elementSubcomponentNames(node.id)),
           KPI: join(componentKpiNames(node.id)),
           Autor: node.owner_name
         }))
@@ -1731,10 +1992,10 @@ function DataWorkspace({
         name: "KPI",
         rows: byType(["KPI"]).map((node) => ({
           Nombre: node.name,
-          Identificación: node.identification ?? "",
+          Código: node.code ?? "",
           Descripción: node.description,
           Evaluación: node.evaluation ?? "",
-          Componentes: join(kpiComponentNames(node.id)),
+          Niveles: join(kpiComponentNames(node.id)),
           Agentes: join(kpiAgentNames(node.id)),
           Autor: node.owner_name
         }))
@@ -1744,9 +2005,11 @@ function DataWorkspace({
       Cadenas: ["Nombre", "Descripción", "Eslabones", "Autor"],
       Eslabones: ["Nombre", "Descripción", "Cadena", "Relación con otros eslabones", "Agentes", "Autor"],
       Ámbitos: ["Nombre", "Descripción", "Componentes", "Autor"],
-      Componentes: ["Nombre", "Descripción", "Ámbitos", "Supercomponentes", "Subcomponentes", "KPI", "Autor"],
+      Componentes: ["Nombre", "Descripción", "Ámbitos", "Subcomponentes", "KPI", "Autor"],
+      Subcomponentes: ["Nombre", "Descripción", "Componentes", "Elementos", "KPI", "Autor"],
+      Elementos: ["Nombre", "Descripción", "Subcomponentes", "KPI", "Autor"],
       Agentes: ["Nombre", "Descripción", "Eslabones", "KPI", "Autor"],
-      KPI: ["Nombre", "Identificación", "Descripción", "Evaluación", "Componentes", "Agentes", "Autor"]
+      KPI: ["Nombre", "Código", "Descripción", "Evaluación", "Niveles", "Agentes", "Autor"]
     };
     sheets.forEach(({ name, rows }) => {
       XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(rows, { header: headers[name] }), name);
@@ -1756,6 +2019,8 @@ function DataWorkspace({
       ValueChainLink: "Eslabón",
       Scope: "Ámbito",
       Component: "Componente",
+      Subcomponent: "Subcomponente",
+      Element: "Elemento",
       PrincipalAgent: "Agente",
       AuxiliaryAgent: "Agente",
       SupportAgent: "Agente",
@@ -1774,14 +2039,14 @@ function DataWorkspace({
     <section className="data-workspace">
       <aside className="data-nav">
         {visibleDataSections.slice(0, 1).map((item) => (
-          <button key={item.id} className={section === item.id ? "active" : ""} onClick={() => setSection(item.id)}>
-            {item.label}
+          <button key={item.id} title={canEditSection(item.id) ? "Puedes modificar esta sección" : "Sección disponible en modo lectura"} className={`${section === item.id ? "active" : ""} ${canEditSection(item.id) ? "editable-level" : "restricted-level"}`} onClick={() => setSection(item.id)}>
+            <span>{item.label}</span>{canEditSection(item.id) ? <Unlock className="level-permission-icon" /> : <Lock className="level-permission-icon" />}
           </button>
         ))}
-        <span className="data-nav-separator" aria-hidden="true" />
+        <span className="data-nav-divider">Niveles</span>
         {visibleDataSections.slice(1).map((item) => (
-          <button key={item.id} className={section === item.id ? "active" : ""} onClick={() => setSection(item.id)}>
-            {item.label}
+          <button key={item.id} title={canEditSection(item.id) ? "Puedes modificar esta sección" : "Sección disponible en modo lectura"} className={`${section === item.id ? "active" : ""} ${canEditSection(item.id) ? "editable-level" : "restricted-level"}`} onClick={() => setSection(item.id)}>
+            <span>{item.label}</span>{canEditSection(item.id) ? <Unlock className="level-permission-icon" /> : <Lock className="level-permission-icon" />}
           </button>
         ))}
         {hasSpecialPermissions(user) && (
@@ -1798,6 +2063,7 @@ function DataWorkspace({
           <div><span>VISTA DE DATOS</span><h1>{dataSections.find((item) => item.id === section)?.label}</h1>
             <p>{section === "Definitions" ? "Consulta las clases y definiciones vigentes de la ontología." : "Consulta datos propios y ajenos sobre el mismo RDF colaborativo."}</p></div>
           <div className="creation-actions">
+            {!!bulkShareItems.length && <button className="secondary bulk-share-action" onClick={() => setSharingBulk(true)}><Users /> Compartir en bloque</button>}
             {section === "Definitions" && hasSpecialPermissions(user) && (
               <button className="primary" onClick={() => openConcept(null)}><Plus /> Crear concepto</button>
             )}
@@ -1825,12 +2091,13 @@ function DataWorkspace({
           <div className="data-table-wrap">
             {section === "Definitions" ? (
               <table className="definitions-table">
-                <thead><tr><th>Concepto</th><th>Definición</th>{hasSpecialPermissions(user) && <th>Acciones</th>}</tr></thead>
+                <thead><tr><th>Concepto</th><th>Definición</th>{(hasSpecialPermissions(user) || visibleConcepts.some(concept => concept.editable)) && <th>Acciones</th>}</tr></thead>
                 <tbody>{visibleConcepts.map((concept) => <tr key={concept.iri}>
                   <td><strong>{concept.label}</strong></td>
                   <td>{concept.definition || "—"}</td>
-                  {hasSpecialPermissions(user) && <td><div className="table-actions">
-                    <button className="table-action" onClick={() => openConcept(concept)}><Pencil /> Editar</button>
+                  {(hasSpecialPermissions(user) || visibleConcepts.some(item => item.editable)) && <td><div className="table-actions">
+                    {concept.editable && <button className="table-action" onClick={() => openConcept(concept)}><Pencil /> Editar</button>}
+                    {hasSpecialPermissions(user) && <button className="table-action share-action" onClick={() => setSharingConcept(concept)}><Users /> Compartir</button>}
                     {isAdmin(user) && <button className="table-action" onClick={() => void toggleConceptVisibility(concept)}>{concept.visible ? "Ocultar a usuarios" : "Hacer visible"}</button>}
                     {concept.deletable && <button className="table-action danger" onClick={() => void deleteConcept(concept)}>Borrar</button>}
                   </div></td>}
@@ -1842,7 +2109,7 @@ function DataWorkspace({
                   <td><strong>{node.name}</strong></td>
                   <td>{node.description || "—"}</td>
                   <td>{renderNamePills(valueChainLinkNames(node.id))}</td>
-                  <td>{node.owner_name}{node.editable && <b className="mine-tag">Tuyo</b>}</td>
+                  <td>{node.owner_name}{node.editable && <b className="mine-tag">{node.owner_id === user.id ? "Tuyo" : "Compartido"}</b>}</td>
                   <td><div className="table-actions">
                     <button
                       className={`table-action activate-chain-action ${activeChainId === node.id ? "active" : ""}`}
@@ -1854,6 +2121,7 @@ function DataWorkspace({
                     <button className="table-action" onClick={() => openDuplicateChain(node)}>
                       <Copy /> Duplicar
                     </button>
+                    {node.owner_id === user.id && <button className="table-action share-action" onClick={() => onShareNode(node)}><Users /> Compartir</button>}
                     {node.editable && <>
                       <button className="table-action" onClick={() => onEditNode(node)}><Pencil /> Editar</button>
                       <button className="table-action danger-action" onClick={() => onDeleteNode(node)}><Trash2 /> Borrar</button>
@@ -1869,9 +2137,10 @@ function DataWorkspace({
                   <td>{node.description || "—"}</td>
                   <td>{renderNamePills(linkRelationDescriptions(node.id))}</td>
                   <td>{renderNamePills(linkAgentNames(node.id))}</td>
-                  <td>{node.owner_name}{node.editable && <b className="mine-tag">Tuyo</b>}</td>
+                  <td>{node.owner_name}{node.editable && <b className="mine-tag">{node.owner_id === user.id ? "Tuyo" : "Compartido"}</b>}</td>
                   <td><div className="table-actions">
                     <button className="table-action" onClick={() => onSelect(node.id)}>Ver grafo</button>
+                    {node.owner_id === user.id && <button className="table-action share-action" onClick={() => onShareNode(node)}><Users /> Compartir</button>}
                     {node.editable && <>
                       <button className="table-action" onClick={() => onEditNode(node)}><Pencil /> Editar</button>
                       <button className="table-action danger-action" onClick={() => onDeleteNode(node)}><Trash2 /> Borrar</button>
@@ -1885,9 +2154,10 @@ function DataWorkspace({
                   <td><strong>{node.name}</strong></td>
                   <td>{node.description || "—"}</td>
                   <td>{renderNamePills(scopeComponentNames(node.id))}</td>
-                  <td>{node.owner_name}{node.editable && <b className="mine-tag">Tuyo</b>}</td>
+                  <td>{node.owner_name}{node.editable && <b className="mine-tag">{node.owner_id === user.id ? "Tuyo" : "Compartido"}</b>}</td>
                   <td><div className="table-actions">
                     <button className="table-action" onClick={() => onSelect(node.id)}>Ver grafo</button>
+                    {node.owner_id === user.id && <button className="table-action share-action" onClick={() => onShareNode(node)}><Users /> Compartir</button>}
                     {node.editable && <>
                       <button className="table-action" onClick={() => onEditNode(node)}><Pencil /> Editar</button>
                       <button className="table-action danger-action" onClick={() => onDeleteNode(node)}><Trash2 /> Borrar</button>
@@ -1897,22 +2167,42 @@ function DataWorkspace({
               </table>
             ) : section === "Component" ? (
               <table className="component-table">
-                <thead><tr><th>Nombre</th><th>Descripción</th><th>Ámbitos</th><th>Supercomponentes</th><th>Subcomponentes</th><th>KPI</th><th>Autor</th><th>Acciones</th></tr></thead>
+                <thead><tr><th>Nombre</th><th>Descripción</th><th>Ámbitos</th><th>Subcomponentes</th><th>KPI</th><th>Autor</th><th>Acciones</th></tr></thead>
                 <tbody>{nodes.map((node) => <tr key={node.id} className={node.editable ? "mine-row" : ""}>
                   <td><strong>{node.name}</strong></td>
                   <td>{node.description || "—"}</td>
                   <td>{renderNamePills(componentScopeNames(node.id))}</td>
-                  <td>{renderNamePills(supercomponentNames(node.id))}</td>
                   <td>{renderNamePills(subcomponentNames(node.id))}</td>
                   <td>{renderNamePills(componentKpiNames(node.id))}</td>
-                  <td>{node.owner_name}{node.editable && <b className="mine-tag">Tuyo</b>}</td>
+                  <td>{node.owner_name}{node.editable && <b className="mine-tag">{node.owner_id === user.id ? "Tuyo" : "Compartido"}</b>}</td>
                   <td><div className="table-actions">
                     <button className="table-action" onClick={() => onSelect(node.id)}>Ver grafo</button>
+                    {node.owner_id === user.id && <button className="table-action share-action" onClick={() => onShareNode(node)}><Users /> Compartir</button>}
                     {node.editable && <>
                       <button className="table-action" onClick={() => onEditNode(node)}><Pencil /> Editar</button>
                       <button className="table-action danger-action" onClick={() => onDeleteNode(node)}><Trash2 /> Borrar</button>
                     </>}
                   </div></td>
+                </tr>)}</tbody>
+              </table>
+            ) : section === "Subcomponent" ? (
+              <table className="component-table">
+                <thead><tr><th>Nombre</th><th>Descripción</th><th>Componentes</th><th>Elementos</th><th>KPI</th><th>Autor</th><th>Acciones</th></tr></thead>
+                <tbody>{nodes.map((node) => <tr key={node.id} className={node.editable ? "mine-row" : ""}>
+                  <td><strong>{node.name}</strong></td><td>{node.description || "—"}</td>
+                  <td>{renderNamePills(parentComponentNames(node.id))}</td><td>{renderNamePills(subcomponentElementNames(node.id))}</td><td>{renderNamePills(componentKpiNames(node.id))}</td>
+                  <td>{node.owner_name}{node.editable && <b className="mine-tag">{node.owner_id === user.id ? "Tuyo" : "Compartido"}</b>}</td>
+                  <td><div className="table-actions"><button className="table-action" onClick={() => onSelect(node.id)}>Ver grafo</button>{node.owner_id === user.id && <button className="table-action share-action" onClick={() => onShareNode(node)}><Users /> Compartir</button>}{node.editable && <><button className="table-action" onClick={() => onEditNode(node)}><Pencil /> Editar</button><button className="table-action danger-action" onClick={() => onDeleteNode(node)}><Trash2 /> Borrar</button></>}</div></td>
+                </tr>)}</tbody>
+              </table>
+            ) : section === "Element" ? (
+              <table className="component-table">
+                <thead><tr><th>Nombre</th><th>Descripción</th><th>Subcomponentes</th><th>KPI</th><th>Autor</th><th>Acciones</th></tr></thead>
+                <tbody>{nodes.map((node) => <tr key={node.id} className={node.editable ? "mine-row" : ""}>
+                  <td><strong>{node.name}</strong></td><td>{node.description || "—"}</td>
+                  <td>{renderNamePills(elementSubcomponentNames(node.id))}</td><td>{renderNamePills(componentKpiNames(node.id))}</td>
+                  <td>{node.owner_name}{node.editable && <b className="mine-tag">{node.owner_id === user.id ? "Tuyo" : "Compartido"}</b>}</td>
+                  <td><div className="table-actions"><button className="table-action" onClick={() => onSelect(node.id)}>Ver grafo</button>{node.owner_id === user.id && <button className="table-action share-action" onClick={() => onShareNode(node)}><Users /> Compartir</button>}{node.editable && <><button className="table-action" onClick={() => onEditNode(node)}><Pencil /> Editar</button><button className="table-action danger-action" onClick={() => onDeleteNode(node)}><Trash2 /> Borrar</button></>}</div></td>
                 </tr>)}</tbody>
               </table>
             ) : section === "Agent" ? (
@@ -1923,9 +2213,10 @@ function DataWorkspace({
                   <td>{node.description || "—"}</td>
                   <td>{renderNamePills(agentLinkNames(node.id))}</td>
                   <td>{renderNamePills(agentKpiNames(node.id))}</td>
-                  <td>{node.owner_name}{node.editable && <b className="mine-tag">Tuyo</b>}</td>
+                  <td>{node.owner_name}{node.editable && <b className="mine-tag">{node.owner_id === user.id ? "Tuyo" : "Compartido"}</b>}</td>
                   <td><div className="table-actions">
                     <button className="table-action" onClick={() => onSelect(node.id)}>Ver grafo</button>
+                    {node.owner_id === user.id && <button className="table-action share-action" onClick={() => onShareNode(node)}><Users /> Compartir</button>}
                     {node.editable && <>
                       {(node.type !== "AuxiliaryAgent" || hasSpecialPermissions(user)) && (
                         <button className="table-action" onClick={() => onEditNode(node)}><Pencil /> Editar</button>
@@ -1937,17 +2228,18 @@ function DataWorkspace({
               </table>
             ) : section === "KPI" ? (
               <table className="kpi-table">
-                <thead><tr><th>Nombre</th><th>Identificación</th><th>Descripción</th><th>Evaluación</th><th>Componentes</th><th>Agentes</th><th>Autor</th><th>Acciones</th></tr></thead>
+                <thead><tr><th>Nombre</th><th>Código</th><th>Descripción</th><th>Evaluación</th><th>Niveles asociados</th><th>Agentes</th><th>Autor</th><th>Acciones</th></tr></thead>
                 <tbody>{nodes.map((node) => <tr key={node.id} className={node.editable ? "mine-row" : ""}>
                   <td><strong>{node.name}</strong></td>
-                  <td>{node.identification || "—"}</td>
+                  <td>{node.code || "—"}</td>
                   <td>{node.description || "—"}</td>
                   <td>{node.evaluation || "—"}</td>
                   <td>{renderNamePills(kpiComponentNames(node.id))}</td>
                   <td>{renderNamePills(kpiAgentNames(node.id))}</td>
-                  <td>{node.owner_name}{node.editable && <b className="mine-tag">Tuyo</b>}</td>
+                  <td>{node.owner_name}{node.editable && <b className="mine-tag">{node.owner_id === user.id ? "Tuyo" : "Compartido"}</b>}</td>
                   <td><div className="table-actions">
                     <button className="table-action" onClick={() => onSelect(node.id)}>Ver grafo</button>
+                    {node.owner_id === user.id && <button className="table-action share-action" onClick={() => onShareNode(node)}><Users /> Compartir</button>}
                     {node.editable && <>
                       <button className="table-action" onClick={() => onEditNode(node)}><Pencil /> Editar</button>
                       <button className="table-action danger-action" onClick={() => onDeleteNode(node)}><Trash2 /> Borrar</button>
@@ -1960,9 +2252,10 @@ function DataWorkspace({
                 <tbody>{nodes.map((node) => <tr key={node.id} className={node.editable ? "mine-row" : ""}>
                   <td><strong>{node.name}</strong></td><td>{node.description || "—"}</td>
                   <td>{snapshot.relations.filter((edge) => edge.source === node.id || edge.target === node.id).length}</td>
-                  <td>{node.owner_name}{node.editable && <b className="mine-tag">Tuyo</b>}</td>
+                  <td>{node.owner_name}{node.editable && <b className="mine-tag">{node.owner_id === user.id ? "Tuyo" : "Compartido"}</b>}</td>
                   <td><div className="table-actions">
                     <button className="table-action" onClick={() => onSelect(node.id)}>Ver grafo</button>
+                    {node.owner_id === user.id && <button className="table-action share-action" onClick={() => onShareNode(node)}><Users /> Compartir</button>}
                     {node.editable && <>
                       <button className="table-action" onClick={() => onEditNode(node)}><Pencil /> Editar</button>
                       <button className="table-action danger-action" onClick={() => onDeleteNode(node)}><Trash2 /> Borrar</button>
@@ -2022,6 +2315,28 @@ function DataWorkspace({
             </div>
           </form>
         </div>,
+        document.body
+      )}
+      {sharingConcept && createPortal(
+        <DefinitionPermissionsDialog
+          concept={sharingConcept}
+          users={users}
+          teams={teams}
+          onClose={() => setSharingConcept(null)}
+          onChanged={loadConcepts}
+        />,
+        document.body
+      )}
+      {sharingBulk && createPortal(
+        <BulkPermissionsDialog
+          kind={section === "Definitions" ? "definitions" : "nodes"}
+          items={bulkShareItems}
+          user={user}
+          users={users}
+          teams={teams}
+          onClose={() => setSharingBulk(false)}
+          onChanged={async () => { await loadConcepts(); await onCreated(); }}
+        />,
         document.body
       )}
     </section>
@@ -2175,7 +2490,7 @@ function ExploreWorkspace({ snapshot }: { snapshot: Snapshot }) {
           <p>{selectedNode.description || "Sin descripción"}</p>
         </div>
         <div className="metadata">
-          {selectedNode.type === "KPI" && <><label>Identificación</label><p>{selectedNode.identification || "—"}</p><label>Evaluación</label><p>{selectedNode.evaluation || "—"}</p></>}
+          {selectedNode.type === "KPI" && <><label>Código</label><p>{selectedNode.code || "—"}</p><label>Evaluación</label><p>{selectedNode.evaluation || "—"}</p></>}
           <label>Estado</label><p>{expandedIds.has(selectedNode.id) ? "Vecindario expandido" : "Pendiente de expandir"}</p><label>Conexiones aún ocultas</label><p>{pendingNeighbours}</p><label>Autor</label><div className="author"><b>{selectedNode.owner_initials}</b><span>{selectedNode.owner_name}</span></div>
         </div>
       </> : <div className="empty-inspector"><CircleDot /><span>Selecciona o expande un nodo para consultar sus detalles.</span></div>}
@@ -2194,9 +2509,11 @@ function Workspace({
 }) {
   const [snapshot, setSnapshot] = useState<Snapshot>(emptySnapshot);
   const [users, setUsers] = useState<User[]>([]);
+  const [teams, setTeams] = useState<Team[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
-  const [dialog, setDialog] = useState<"node" | "relation" | "password" | "users" | null>(null);
+  const [dialog, setDialog] = useState<"node" | "relation" | "password" | "users" | "teams" | "permissions" | null>(null);
   const [editingNode, setEditingNode] = useState<GraphNode | null>(null);
+  const [sharingNode, setSharingNode] = useState<GraphNode | null>(null);
   const [createType, setCreateType] = useState<NodeType>("Scope");
   const [connected, setConnected] = useState(1);
   const [filters, setFilters] = useState<Filters>(emptyFilters);
@@ -2206,12 +2523,31 @@ function Workspace({
   const [activeChainId, setActiveChainId] = useState<string | null>(() => localStorage.getItem(`orca-active-chain-${user.id}`));
   const [chainPickerOpen, setChainPickerOpen] = useState(false);
   const [chainQuery, setChainQuery] = useState("");
+  const [viewSwitcherOpen, setViewSwitcherOpen] = useState(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
+  const [openGraphTypes, setOpenGraphTypes] = useState<Set<NodeType>>(new Set());
+  const [graphNodeQuery, setGraphNodeQuery] = useState("");
+  const [hiddenGraphNodeIds, setHiddenGraphNodeIds] = useState<Set<string>>(new Set());
+  const [expandedGraphNodeIds, setExpandedGraphNodeIds] = useState<Set<string>>(new Set());
+  const [inspectorRelationsOpen, setInspectorRelationsOpen] = useState(true);
+  const viewSwitcherRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const closeViewSwitcher = (event: globalThis.MouseEvent) => {
+      if (!viewSwitcherRef.current?.contains(event.target as Node)) setViewSwitcherOpen(false);
+    };
+    document.addEventListener("mousedown", closeViewSwitcher);
+    return () => document.removeEventListener("mousedown", closeViewSwitcher);
+  }, []);
 
   const load = useCallback(async (clearRemoteChange = false) => {
     try {
-      const [graph, people] = await Promise.all([api.graph(), api.users()]);
+      const [graph, people, teamList] = await Promise.all([api.graph(), api.users(), api.teams()]);
       setSnapshot(graph);
       setUsers(people);
+      setTeams(teamList);
       if (clearRemoteChange) setRemoteChange(null);
       setError("");
     } catch (reason) {
@@ -2260,6 +2596,10 @@ function Workspace({
     localStorage.setItem(`orca-active-chain-${user.id}`, chainId);
     setSelected(null);
     setFilters(emptyFilters);
+    setHiddenGraphNodeIds(new Set());
+    setExpandedGraphNodeIds(new Set());
+    setOpenGraphTypes(new Set());
+    setGraphNodeQuery("");
     setChainPickerOpen(false);
     setChainQuery("");
   };
@@ -2269,8 +2609,25 @@ function Workspace({
     setChainPickerOpen(true);
   };
 
-  const filtered = useMemo(() => filterGraph(chainSnapshot, filters), [chainSnapshot, filters]);
-  const scopes = chainSnapshot.nodes.filter((node) => node.type === "Scope");
+  const filteredBase = useMemo(() => filterGraph(chainSnapshot, filters), [chainSnapshot, filters]);
+  const filtered = useMemo(() => {
+    const visibleIds = new Set(
+      filteredBase.nodes.filter(node => !hiddenGraphNodeIds.has(node.id)).map(node => node.id)
+    );
+    expandedGraphNodeIds.forEach(nodeId => {
+      if (hiddenGraphNodeIds.has(nodeId)) return;
+      visibleIds.add(nodeId);
+      chainSnapshot.relations.forEach(edge => {
+        if (edge.source === nodeId && !hiddenGraphNodeIds.has(edge.target)) visibleIds.add(edge.target);
+        if (edge.target === nodeId && !hiddenGraphNodeIds.has(edge.source)) visibleIds.add(edge.source);
+      });
+    });
+    return {
+      ...chainSnapshot,
+      nodes: chainSnapshot.nodes.filter(node => visibleIds.has(node.id)),
+      relations: chainSnapshot.relations.filter(edge => visibleIds.has(edge.source) && visibleIds.has(edge.target))
+    };
+  }, [chainSnapshot, filteredBase, hiddenGraphNodeIds, expandedGraphNodeIds]);
   const selectedNode = chainSnapshot.nodes.find((node) => node.id === selected);
   const selectedRelations = chainSnapshot.relations.filter((edge) => edge.source === selected || edge.target === selected);
   const selectedDegree = selectedNode
@@ -2280,8 +2637,58 @@ function Workspace({
         )
       ).size
     : 0;
+  const selectedNeighbourIds = selectedNode
+    ? [...new Set(selectedRelations.map(edge => edge.source === selectedNode.id ? edge.target : edge.source))]
+    : [];
+  const visibleGraphNodeIds = new Set(filtered.nodes.map(node => node.id));
+  const allSelectedNeighboursVisible = selectedNeighbourIds.length > 0
+    && selectedNeighbourIds.every(id => visibleGraphNodeIds.has(id));
+  useEffect(() => setInspectorRelationsOpen(true), [selected]);
   const setFilter = <K extends keyof Filters>(key: K, value: Filters[K]) =>
     setFilters((current) => ({ ...current, [key]: value }));
+  const toggleGraphType = (type: NodeType) => setOpenGraphTypes(current => {
+    const next = new Set(current);
+    if (next.has(type)) next.delete(type); else next.add(type);
+    return next;
+  });
+  const toggleGraphNode = (nodeId: string) => setHiddenGraphNodeIds(current => {
+    const next = new Set(current);
+    if (next.has(nodeId)) next.delete(nodeId); else next.add(nodeId);
+    return next;
+  });
+  const setGraphTypeVisibility = (type: NodeType, visible: boolean) => setHiddenGraphNodeIds(current => {
+    const next = new Set(current);
+    chainSnapshot.nodes.filter(node => node.type === type).forEach(node => visible ? next.delete(node.id) : next.add(node.id));
+    return next;
+  });
+  const selectGraphNode = useCallback((nodeId: string | null) => setSelected(nodeId), []);
+  const expandGraphNode = useCallback((nodeId: string) => {
+    const neighbours = new Set<string>();
+    chainSnapshot.relations.forEach(edge => {
+      if (edge.source === nodeId) neighbours.add(edge.target);
+      if (edge.target === nodeId) neighbours.add(edge.source);
+    });
+    setSelected(nodeId);
+    setExpandedGraphNodeIds(current => new Set(current).add(nodeId));
+    setHiddenGraphNodeIds(current => {
+      const next = new Set(current);
+      neighbours.forEach(id => next.delete(id));
+      next.delete(nodeId);
+      return next;
+    });
+  }, [chainSnapshot]);
+  const toggleSelectedNeighbours = () => {
+    if (!selectedNode || !selectedNeighbourIds.length) return;
+    if (allSelectedNeighboursVisible) {
+      setHiddenGraphNodeIds(current => {
+        const next = new Set(current);
+        selectedNeighbourIds.forEach(id => next.add(id));
+        return next;
+      });
+    } else {
+      expandGraphNode(selectedNode.id);
+    }
+  };
   const openCreate = (type: NodeType) => {
     if (type !== "ValueChain" && !activeChain) return;
     setEditingNode(null);
@@ -2292,6 +2699,10 @@ function Workspace({
     setEditingNode(node);
     setCreateType(node.type);
     setDialog("node");
+  };
+  const openShare = (node: GraphNode) => {
+    setSharingNode(node);
+    setDialog("permissions");
   };
 
   async function removeNode(node: GraphNode) {
@@ -2318,16 +2729,29 @@ function Workspace({
   }
 
   return (
-    <main className="app-shell">
+    <main className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${inspectorCollapsed ? "inspector-collapsed" : ""}`}>
       <header className="topbar">
         <div className="brand">
           <img src="/assets/orca-graph-logo.webp" alt="ORCA Graph" />
         </div>
-        <nav className="view-tabs" aria-label="Cambiar de vista">
-          <button className={view === "data" ? "active" : ""} onClick={() => setView("data")}>▤ Vista de datos</button>
-          <button className={view === "graph" ? "active" : ""} onClick={() => setView("graph")}>⌘ Vista de grafo</button>
-          <button className={view === "explore" ? "active" : ""} onClick={() => setView("explore")}><Search /> Explorar</button>
-        </nav>
+        <div className={`view-switcher ${viewSwitcherOpen ? "open" : ""}`} ref={viewSwitcherRef}>
+          <button type="button" className="view-switcher-trigger" aria-haspopup="listbox" aria-expanded={viewSwitcherOpen} onClick={() => setViewSwitcherOpen(current => !current)}>
+            <span className="view-switcher-current-icon">{view === "data" ? <FileSpreadsheet /> : view === "graph" ? <GitBranch /> : <Search />}</span>
+            <span className="view-switcher-current-copy"><small>Vista actual</small><strong>{view === "data" ? "Vista de datos" : view === "graph" ? "Vista de grafo" : "Explorar"}</strong></span>
+            <ChevronDown className="view-switcher-chevron" />
+          </button>
+          {viewSwitcherOpen && <div className="view-switcher-menu" role="listbox" aria-label="Seleccionar vista">
+            {([
+              { id: "data" as const, label: "Vista de datos", detail: "Consulta y edita tablas", icon: <FileSpreadsheet /> },
+              { id: "graph" as const, label: "Vista de grafo", detail: "Visualiza toda la cadena", icon: <GitBranch /> },
+              { id: "explore" as const, label: "Explorar", detail: "Navega nodo a nodo", icon: <Search /> }
+            ]).map(option => <button type="button" role="option" aria-selected={view === option.id} className={view === option.id ? "active" : ""} key={option.id} onClick={() => { setView(option.id); setViewSwitcherOpen(false); }}>
+              <span className="view-option-icon">{option.icon}</span>
+              <span><strong>{option.label}</strong><small>{option.detail}</small></span>
+              {view === option.id && <Check className="view-option-check" />}
+            </button>)}
+          </div>}
+        </div>
         <div className="presence"><i /> {connected} colaboradores conectados</div>
         <div className="top-actions">
           <div className="user-area">
@@ -2339,10 +2763,34 @@ function Workspace({
           {isAdmin(user) && (
             <button className="header-action header-action-primary" onClick={() => setDialog("users")}><UserCog /> Usuarios</button>
           )}
+          <button className="header-action" onClick={() => setDialog("teams")}><Users /> Equipos</button>
         </div>
+        <button className="mobile-menu-toggle" type="button" aria-label="Abrir menú" aria-expanded={mobileMenuOpen} onClick={() => setMobileMenuOpen(true)}><Menu /></button>
+        <div className={`mobile-menu-backdrop ${mobileMenuOpen ? "open" : ""}`} onClick={() => setMobileMenuOpen(false)} />
+        <section className={`mobile-menu-panel ${mobileMenuOpen ? "open" : ""}`} aria-hidden={!mobileMenuOpen}>
+          <div className="mobile-menu-head">
+            <div className="mobile-menu-user"><b>{user.initials}</b><span><strong>{user.display_name}</strong><small>{roleLabels[user.role]}</small></span></div>
+            <button type="button" className="icon" aria-label="Cerrar menú" onClick={() => setMobileMenuOpen(false)}><X /></button>
+          </div>
+          <div className="mobile-menu-section"><span>Vistas</span>
+            <button className={`mobile-action ${view === "data" ? "active" : ""}`} onClick={() => { setView("data"); setMobileMenuOpen(false); }}>▤ Vista de datos</button>
+            <button className={`mobile-action ${view === "graph" ? "active" : ""}`} onClick={() => { setView("graph"); setMobileMenuOpen(false); }}>⌘ Vista de grafo</button>
+            <button className={`mobile-action ${view === "explore" ? "active" : ""}`} onClick={() => { setView("explore"); setMobileMenuOpen(false); }}><Search /> Explorar</button>
+          </div>
+          <div className="mobile-presence"><i /> {connected} colaboradores conectados</div>
+          <div className="mobile-menu-section"><span>Cuenta y administración</span>
+            <button className="mobile-action" onClick={() => { setDialog("password"); setMobileMenuOpen(false); }}><KeyRound /> Cambiar contraseña</button>
+            {isAdmin(user) && <button className="mobile-action" onClick={() => { setDialog("users"); setMobileMenuOpen(false); }}><UserCog /> Usuarios</button>}
+            <button className="mobile-action" onClick={() => { setDialog("teams"); setMobileMenuOpen(false); }}><Users /> Equipos</button>
+            <button className="mobile-action danger-action" onClick={() => { setMobileMenuOpen(false); onLogout(); }}><LogOut /> Salir</button>
+          </div>
+        </section>
       </header>
 
       <section className="active-chain-bar">
+        <button type="button" className="sidebar-toggle" title={sidebarCollapsed ? "Desplegar menú lateral" : "Contraer menú lateral"} aria-label={sidebarCollapsed ? "Desplegar menú lateral" : "Contraer menú lateral"} aria-expanded={!sidebarCollapsed} onClick={() => setSidebarCollapsed(current => !current)}>
+          {sidebarCollapsed ? <PanelLeftOpen /> : <PanelLeftClose />}
+        </button>
         <div className="active-chain-summary"><span>Cadena activa</span><strong>{activeChain?.name ?? "Selecciona una cadena para comenzar"}</strong></div>
         <button type="button" className="active-chain-switcher" onClick={openChainPicker}>
           <span>
@@ -2351,6 +2799,7 @@ function Workspace({
           </span>
           <b>{activeChain ? "Cambiar" : "Seleccionar"}</b>
         </button>
+        {view === "graph" && inspectorCollapsed && <button type="button" className="inspector-restore-toggle" title="Mostrar Inspector" aria-label="Mostrar Inspector" onClick={() => setInspectorCollapsed(false)}><PanelRightOpen /></button>}
       </section>
 
       {view === "data" ? (
@@ -2365,23 +2814,52 @@ function Workspace({
           onCreateNode={openCreate}
           onEditNode={openEdit}
           onDeleteNode={removeNode}
+          onShareNode={openShare}
+          users={users}
+          teams={teams}
         />
       ) : view === "explore" ? (
         <ExploreWorkspace snapshot={chainSnapshot} />
       ) : <section className="workspace">
         <aside className="sidebar">
-          <div className="panel-title"><span>Modelo v7</span><ShieldCheck /></div>
+          <div className="panel-title"><span>Modelo v8</span><ShieldCheck /></div>
+          <div className="graph-node-search">
+            <Search />
+            <input value={graphNodeQuery} onChange={event => setGraphNodeQuery(event.target.value)} placeholder="Buscar nodos por nombre…" aria-label="Buscar nodos por nombre" />
+            {graphNodeQuery && <button type="button" onClick={() => setGraphNodeQuery("")} aria-label="Limpiar búsqueda"><X /></button>}
+          </div>
           <div className="type-list">
-            {(Object.keys(typeInfo) as NodeType[]).map((type) => (
-              <div className={`type-row type-${type.toLowerCase()}`} key={type}>
-                <i /><span>{typeInfo[type].label}</span>
-                <b>{chainSnapshot.nodes.filter((node) => node.type === type).length}</b>
-              </div>
-            ))}
+            {(Object.keys(typeInfo) as NodeType[]).map((type) => {
+              const categoryNodes = chainSnapshot.nodes.filter(node => node.type === type)
+                .sort((left, right) => left.name.localeCompare(right.name, "es"));
+              const normalizedQuery = graphNodeQuery.trim().toLocaleLowerCase("es");
+              const matchingCategoryNodes = normalizedQuery
+                ? categoryNodes.filter(node => node.name.toLocaleLowerCase("es").includes(normalizedQuery))
+                : categoryNodes;
+              const visibleCount = categoryNodes.filter(node => !hiddenGraphNodeIds.has(node.id)).length;
+              const categoryOpen = openGraphTypes.has(type);
+              const categoryExpanded = categoryOpen || Boolean(normalizedQuery && matchingCategoryNodes.length);
+              return <div className={`type-category type-${type.toLowerCase()} ${categoryExpanded ? "open" : ""}`} key={type}>
+                <button type="button" className="type-row" aria-expanded={categoryExpanded} onClick={() => toggleGraphType(type)}>
+                  <i /><span>{typeInfo[type].label}</span>
+                  <b>{visibleCount}/{categoryNodes.length}</b><ChevronDown />
+                </button>
+                {categoryExpanded && <div className="type-node-dropdown">
+                  <div className="type-node-actions">
+                    <button type="button" onClick={() => setGraphTypeVisibility(type, true)}>Mostrar todos</button>
+                    <button type="button" onClick={() => setGraphTypeVisibility(type, false)}>Ocultar todos</button>
+                  </div>
+                  {matchingCategoryNodes.map(node => <label className={hiddenGraphNodeIds.has(node.id) ? "hidden-node" : ""} key={node.id}>
+                    <input type="checkbox" checked={!hiddenGraphNodeIds.has(node.id)} onChange={() => toggleGraphNode(node.id)} />
+                    <span title={node.name}>{node.name}</span>
+                  </label>)}
+                  {!matchingCategoryNodes.length && <p>{normalizedQuery ? "No hay coincidencias." : "Sin nodos en la cadena activa."}</p>}
+                </div>}
+              </div>;
+            })}
           </div>
           <div className="filter-panel">
             <span className="section-label">Filtrar grafo</span>
-            <MultiFilterSelect label="Ámbito" options={scopes.map((scope) => ({ value: scope.id, label: scope.name }))} selected={filters.scope} onChange={(value) => setFilter("scope", value)} placeholder="Todos los ámbitos" />
             <MultiFilterSelect label="Usuario" options={[
               { value: "global", label: "Modelo compartido", detail: "Conceptos sin autor" },
               ...users.map((person) => ({ value: person.id, label: person.display_name, detail: roleLabels[person.role] }))
@@ -2392,7 +2870,7 @@ function Workspace({
             <MultiFilterSelect label="Nodo y vecindario" options={[...chainSnapshot.nodes]
               .sort((left, right) => left.name.localeCompare(right.name, "es"))
               .map((node) => ({ value: node.id, label: node.name, detail: `${typeInfo[node.type].label} · ${node.owner_name}` }))} selected={filters.node} onChange={(value) => setFilter("node", value)} placeholder="Todos los nodos" />
-            <button className="secondary wide" onClick={() => setFilters(emptyFilters)}>
+            <button className="secondary wide" onClick={() => { setFilters(emptyFilters); setHiddenGraphNodeIds(new Set()); setExpandedGraphNodeIds(new Set()); }}>
               <FilterX /> Limpiar filtros
             </button>
           </div>
@@ -2410,13 +2888,14 @@ function Workspace({
             <div>
               <span><CircleDot /> {filtered.nodes.length} nodos</span>
               <span><GitBranch /> {filtered.relations.length} relaciones</span>
+              <span>{expandedGraphNodeIds.size} expandidos</span>
               <span><Users /> {users.length} autores</span>
             </div>
             <button className={`ghost ${remoteChange ? "refresh-pending" : ""}`} onClick={refreshGraph}>
               <Maximize2 /> Actualizar grafo{remoteChange ? " •" : ""}
             </button>
           </div>
-          <GraphCanvas snapshot={filtered} selected={selected} onSelect={setSelected} />
+          <GraphCanvas snapshot={filtered} selected={selected} onSelect={selectGraphNode} onExpand={expandGraphNode} />
           {remoteChange && (
             <div className="graph-change-notice" role="status">
               <span>{remoteChange} Pulsa «Actualizar grafo» para incorporar los cambios.</span>
@@ -2427,7 +2906,7 @@ function Workspace({
         </section>
 
         <aside className="inspector">
-          <div className="panel-title"><span>Inspector</span></div>
+          <div className="panel-title inspector-panel-title"><span>Inspector</span><button type="button" title="Contraer Inspector" aria-label="Contraer Inspector" onClick={() => setInspectorCollapsed(true)}><PanelRightClose /></button></div>
           {selectedNode ? (
             <>
               <div className="inspector-head">
@@ -2437,18 +2916,24 @@ function Workspace({
                 <p>{selectedNode.description || "Sin descripción"}</p>
               </div>
               <div className="metadata">
-                {selectedNode.type === "KPI" && <><label>Identificación</label><p>{selectedNode.identification || "—"}</p><label>Evaluación</label><p>{selectedNode.evaluation || "—"}</p></>}
+                {selectedNode.type === "KPI" && <><label>Código</label><p>{selectedNode.code || "—"}</p><label>Evaluación</label><p>{selectedNode.evaluation || "—"}</p></>}
                 <label>Autor</label>
                 <div className="author"><b>{selectedNode.owner_initials}</b><span>{selectedNode.owner_name}</span></div>
                 <label>Permisos</label>
                 <p>{selectedNode.editable ? "Editable por ti" : "Visible en modo lectura"}</p>
+                {selectedNode.owner_id === user.id && <button className="secondary wide" onClick={() => openShare(selectedNode)}><Users /> Compartir permisos</button>}
                 <label>Conectividad</label>
                 <p>{selectedDegree} {selectedDegree === 1 ? "nodo vecino" : "nodos vecinos"}</p>
+                <button type="button" className="secondary wide neighbour-toggle" disabled={!selectedNeighbourIds.length} onClick={toggleSelectedNeighbours}>
+                  <GitBranch /> {allSelectedNeighboursVisible ? "Ocultar vecinos" : "Mostrar vecinos"}
+                </button>
                 {selectedNode.support_agent_subtype && (
                   <><label>Tipo de agente de apoyo</label><p>{supportAgentSubtypeLabels[selectedNode.support_agent_subtype]}</p></>
                 )}
-                <label>Relaciones</label>
-                <div className="relation-list">
+                <button type="button" className="inspector-relations-toggle" aria-expanded={inspectorRelationsOpen} onClick={() => setInspectorRelationsOpen(current => !current)}>
+                  <span>Relaciones <b>{selectedRelations.length}</b></span><ChevronDown />
+                </button>
+                {inspectorRelationsOpen && <div className="relation-list inspector-relation-list">
                   {selectedRelations.map((edge, index) => {
                     const otherId = edge.source === selectedNode.id ? edge.target : edge.source;
                     const other = chainSnapshot.nodes.find((node) => node.id === otherId);
@@ -2469,7 +2954,8 @@ function Workspace({
                       </div>
                     );
                   })}
-                </div>
+                  {!selectedRelations.length && <p className="empty-relations">Este nodo no tiene relaciones.</p>}
+                </div>}
                 <label>IRI</label><code>{selectedNode.id}</code>
                 {(selectedNode.type !== "AuxiliaryAgent" || hasSpecialPermissions(user)) && (
                   <button className="secondary wide" onClick={() => setDialog("relation")}><GitBranch /> Crear relación</button>
@@ -2488,14 +2974,10 @@ function Workspace({
       </section>}
 
       <footer>
-        <a
-          className="skai-credit"
-          href="https://skai.etsisi.upm.es/"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          Powered by SKAI Research Group
-        </a>
+        <div className="footer-project-links">
+          <a className="skai-credit" href="https://skai.etsisi.upm.es/" target="_blank" rel="noopener noreferrer">Powered by SKAI Research Group</a>
+          <a className="repository-credit" href="https://github.com/skai-upm/fiap-orca-graph" target="_blank" rel="noopener noreferrer"><Github /> GitHub</a>
+        </div>
         <div>
           <span className="app-version">ORCA Graph v{APP_VERSION}</span>
           <span><i className="line" /> Relación estructural</span>
@@ -2528,10 +3010,12 @@ function Workspace({
         </div>
       )}
 
-      {dialog === "node" && <NodeDialog initialType={createType} initialNode={editingNode} nodes={workspaceSnapshot.nodes} relations={snapshot.relations} activeChainId={activeChainId} canManageValueChain={canManageValueChains(user)} canManageRestrictedAgents={hasSpecialPermissions(user)} onClose={() => { setDialog(null); setEditingNode(null); }} onCreated={load} />}
+      {dialog === "node" && <NodeDialog initialType={createType} initialNode={editingNode} nodes={workspaceSnapshot.nodes} relations={snapshot.relations} activeChainId={activeChainId} users={users} teams={teams} canSharePermissions={!editingNode || editingNode.owner_id === user.id} canManageValueChain={canManageValueChains(user)} canManageRestrictedAgents={hasSpecialPermissions(user)} onClose={() => { setDialog(null); setEditingNode(null); }} onCreated={load} />}
       {dialog === "relation" && <RelationDialog nodes={chainSnapshot.nodes} relations={chainSnapshot.relations} canManageValueChain={canManageValueChains(user)} initialSource={selected} onClose={() => setDialog(null)} onCreated={load} />}
       {dialog === "password" && <PasswordDialog onClose={() => setDialog(null)} onChanged={onPasswordChanged} />}
       {dialog === "users" && <UserAdminDialog currentUser={user} users={users} onClose={() => setDialog(null)} onChanged={load} />}
+      {dialog === "teams" && <TeamsDialog user={user} users={users} teams={teams} onClose={() => setDialog(null)} onChanged={load} />}
+      {dialog === "permissions" && sharingNode && <PermissionsDialog node={sharingNode} users={users} teams={teams} onClose={() => { setDialog(null); setSharingNode(null); }} onChanged={load} />}
     </main>
   );
 }

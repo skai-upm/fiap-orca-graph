@@ -180,15 +180,16 @@ async def test_normal_user_cannot_delete_ontology_concept():
 
 
 @pytest.mark.asyncio
-async def test_original_ontology_concept_cannot_be_deleted(monkeypatch):
-    async def fake_delete(_iri):
-        raise PermissionError("Los conceptos originales de la ontología no se pueden borrar; solo editar")
-
+async def test_original_ontology_concept_can_be_deleted_by_authorized_user(monkeypatch):
+    captured = {}
+    async def fake_delete(iri):
+        captured["iri"] = iri
+    async def fake_publish(_payload):
+        return None
     monkeypatch.setattr("app.main.graphdb.delete_concept", fake_delete)
-    with pytest.raises(HTTPException) as error:
-        await delete_concept("https://orca-graph.example/ontology/KPI", special_user())
-    assert error.value.status_code == 409
-    assert "no se pueden borrar" in error.value.detail
+    monkeypatch.setattr("app.main.hub.publish", fake_publish)
+    await delete_concept("https://orca-graph.example/ontology/KPI", special_user())
+    assert captured["iri"].endswith("KPI")
 
 
 @pytest.mark.asyncio

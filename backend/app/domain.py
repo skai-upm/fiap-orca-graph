@@ -1,4 +1,5 @@
 from enum import StrEnum
+from uuid import uuid4
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -10,6 +11,8 @@ OM = "http://www.ontology-of-units-of-measure.org/resource/om-2/"
 class NodeType(StrEnum):
     SCOPE = "Scope"
     COMPONENT = "Component"
+    SUBCOMPONENT = "Subcomponent"
+    ELEMENT = "Element"
     KPI = "KPI"
     VALUE_CHAIN = "ValueChain"
     VALUE_CHAIN_LINK = "ValueChainLink"
@@ -22,6 +25,12 @@ class UserRole(StrEnum):
     ADMIN = "admin"
     SPECIAL = "special"
     NORMAL = "normal"
+
+
+def role_can_manage_node_type(role: str, node_type: NodeType) -> bool:
+    if role in {UserRole.ADMIN.value, UserRole.SPECIAL.value}:
+        return True
+    return node_type in {NodeType.SCOPE, NodeType.COMPONENT, NodeType.SUBCOMPONENT, NodeType.ELEMENT, NodeType.KPI}
 
 
 class SupportAgentSubtype(StrEnum):
@@ -42,7 +51,9 @@ class RelationType(StrEnum):
     HAS_COMPONENT = "hasComponent"
     IS_COMPONENT_OF = "isComponentOf"
     HAS_SUBCOMPONENT = "hasSubcomponent"
-    HAS_SUPERCOMPONENT = "hasSupercomponent"
+    IS_SUBCOMPONENT_OF = "isSubcomponentOf"
+    HAS_ELEMENT = "hasElement"
+    IS_ELEMENT_OF = "isElementOf"
     SIMILAR_TO = "similarTo"
     HAS_VALUE_CHAIN_LINK = "hasValueChainLink"
     IS_VALUE_CHAIN_LINK_OF = "isValueChainLinkOf"
@@ -68,8 +79,10 @@ class RelationType(StrEnum):
 INVERSE_RELATIONS: dict[RelationType, RelationType] = {
     RelationType.HAS_COMPONENT: RelationType.IS_COMPONENT_OF,
     RelationType.IS_COMPONENT_OF: RelationType.HAS_COMPONENT,
-    RelationType.HAS_SUBCOMPONENT: RelationType.HAS_SUPERCOMPONENT,
-    RelationType.HAS_SUPERCOMPONENT: RelationType.HAS_SUBCOMPONENT,
+    RelationType.HAS_SUBCOMPONENT: RelationType.IS_SUBCOMPONENT_OF,
+    RelationType.IS_SUBCOMPONENT_OF: RelationType.HAS_SUBCOMPONENT,
+    RelationType.HAS_ELEMENT: RelationType.IS_ELEMENT_OF,
+    RelationType.IS_ELEMENT_OF: RelationType.HAS_ELEMENT,
     RelationType.HAS_VALUE_CHAIN_LINK: RelationType.IS_VALUE_CHAIN_LINK_OF,
     RelationType.IS_VALUE_CHAIN_LINK_OF: RelationType.HAS_VALUE_CHAIN_LINK,
     RelationType.BELONGS_TO: RelationType.HAS_PRINCIPAL_AGENT,
@@ -93,13 +106,17 @@ NEW_NODE_SOURCE_RELATIONS = {
 ALLOWED_RELATIONS: dict[tuple[NodeType, NodeType], set[RelationType]] = {
     (NodeType.SCOPE, NodeType.COMPONENT): {RelationType.HAS_COMPONENT},
     (NodeType.COMPONENT, NodeType.SCOPE): {RelationType.IS_COMPONENT_OF},
-    (NodeType.COMPONENT, NodeType.COMPONENT): {
-        RelationType.HAS_SUBCOMPONENT,
-        RelationType.HAS_SUPERCOMPONENT,
-    },
+    (NodeType.COMPONENT, NodeType.SUBCOMPONENT): {RelationType.HAS_SUBCOMPONENT},
+    (NodeType.SUBCOMPONENT, NodeType.COMPONENT): {RelationType.IS_SUBCOMPONENT_OF},
+    (NodeType.SUBCOMPONENT, NodeType.ELEMENT): {RelationType.HAS_ELEMENT},
+    (NodeType.ELEMENT, NodeType.SUBCOMPONENT): {RelationType.IS_ELEMENT_OF},
     (NodeType.COMPONENT, NodeType.KPI): {RelationType.HAS_KPI},
+    (NodeType.SUBCOMPONENT, NodeType.KPI): {RelationType.HAS_KPI},
+    (NodeType.ELEMENT, NodeType.KPI): {RelationType.HAS_KPI},
     (NodeType.KPI, NodeType.KPI): {RelationType.SIMILAR_TO},
     (NodeType.KPI, NodeType.COMPONENT): {RelationType.APPLIES_TO_COMPONENT},
+    (NodeType.KPI, NodeType.SUBCOMPONENT): {RelationType.APPLIES_TO_COMPONENT},
+    (NodeType.KPI, NodeType.ELEMENT): {RelationType.APPLIES_TO_COMPONENT},
     (NodeType.VALUE_CHAIN, NodeType.VALUE_CHAIN_LINK): {
         RelationType.HAS_VALUE_CHAIN_LINK
     },
@@ -163,7 +180,7 @@ class NodeCreate(BaseModel):
     type: NodeType
     name: str = Field(min_length=1, max_length=200)
     description: str = Field(default="", max_length=2000)
-    identification: str | None = Field(default=None, max_length=2000)
+    code: str | None = Field(default=None, max_length=2000)
     evaluation: str | None = Field(default=None, max_length=2000)
     support_agent_subtype: SupportAgentSubtype | None = None
     parent: ParentLink | None = None
@@ -175,15 +192,17 @@ class NodeCreate(BaseModel):
         self.description = self.description.strip()
         if not self.name:
             raise ValueError("Name is required")
-        if self.type in {NodeType.SCOPE, NodeType.COMPONENT} and not self.description:
+        if self.type in {NodeType.SCOPE, NodeType.COMPONENT, NodeType.SUBCOMPONENT, NodeType.ELEMENT} and not self.description:
             raise ValueError(f"A {self.type.value.lower()} requires a description")
         if self.type == NodeType.KPI:
-            self.identification = (self.identification or "").strip()
+            self.code = (self.code or "").strip()
             self.evaluation = (self.evaluation or "").strip()
-            if not self.identification or not self.description or not self.evaluation:
-                raise ValueError("A KPI requires identification, description and evaluation")
-        elif self.identification is not None or self.evaluation is not None:
-            raise ValueError("Only a KPI can have identification and evaluation")
+            if not self.code:
+                self.code = str(uuid4())
+            if not self.description or not self.evaluation:
+                raise ValueError("A KPI requires description and evaluation")
+        elif self.code is not None or self.evaluation is not None:
+            raise ValueError("Only a KPI can have code and evaluation")
         if self.type == NodeType.SUPPORT_AGENT:
             self.support_agent_subtype = (
                 self.support_agent_subtype or SupportAgentSubtype.GENERAL
@@ -203,7 +222,7 @@ class NodeCreate(BaseModel):
 class NodeUpdate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     description: str = Field(default="", max_length=2000)
-    identification: str | None = Field(default=None, max_length=2000)
+    code: str | None = Field(default=None, max_length=2000)
     evaluation: str | None = Field(default=None, max_length=2000)
     support_agent_subtype: SupportAgentSubtype | None = None
 
@@ -236,7 +255,7 @@ class Node(BaseModel):
     type: NodeType
     name: str
     description: str = ""
-    identification: str | None = None
+    code: str | None = None
     evaluation: str | None = None
     support_agent_subtype: SupportAgentSubtype | None = None
     graph: str
@@ -275,6 +294,7 @@ class OntologyConcept(BaseModel):
     definition: str
     visible: bool = True
     deletable: bool = False
+    editable: bool = False
 
 
 class OntologyConceptCreate(BaseModel):
@@ -326,6 +346,58 @@ class UserCreateCommand(BaseModel):
 class PasswordChangeCommand(BaseModel):
     current_password: str = Field(min_length=1, max_length=200)
     new_password: str = Field(min_length=8, max_length=200)
+
+
+class TeamCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    member_ids: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def normalize(self) -> "TeamCreate":
+        self.name = self.name.strip()
+        if not self.name:
+            raise ValueError("El nombre del equipo es obligatorio")
+        self.member_ids = list(dict.fromkeys(self.member_ids))
+        return self
+
+
+class TeamUpdate(TeamCreate):
+    pass
+
+
+class Team(BaseModel):
+    id: str
+    name: str
+    member_ids: list[str]
+
+
+class PermissionTargetType(StrEnum):
+    USER = "user"
+    TEAM = "team"
+
+
+class NodePermissionGrant(BaseModel):
+    target_type: PermissionTargetType
+    target_id: str = Field(min_length=1)
+
+
+class NodePermissionUpdate(BaseModel):
+    grants: list[NodePermissionGrant] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def deduplicate(self) -> "NodePermissionUpdate":
+        unique = {(item.target_type, item.target_id): item for item in self.grants}
+        self.grants = list(unique.values())
+        return self
+
+
+class BulkPermissionUpdate(NodePermissionUpdate):
+    resource_ids: list[str] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def deduplicate_resources(self) -> "BulkPermissionUpdate":
+        self.resource_ids = list(dict.fromkeys(self.resource_ids))
+        return self
 
 
 def validate_relation(

@@ -1,6 +1,8 @@
 export type NodeType =
   | "Scope"
   | "Component"
+  | "Subcomponent"
+  | "Element"
   | "KPI"
   | "ValueChain"
   | "ValueChainLink"
@@ -21,7 +23,9 @@ export type RelationType =
   | "hasComponent"
   | "isComponentOf"
   | "hasSubcomponent"
-  | "hasSupercomponent"
+  | "isSubcomponentOf"
+  | "hasElement"
+  | "isElementOf"
   | "similarTo"
   | "hasValueChainLink"
   | "isValueChainLinkOf"
@@ -50,12 +54,24 @@ export interface User {
 
 export type UserRole = "admin" | "special" | "normal";
 
+export interface Team {
+  id: string;
+  name: string;
+  member_ids: string[];
+}
+
+export interface NodePermissionGrant {
+  target_type: "user" | "team";
+  target_id: string;
+}
+
 export interface OntologyConcept {
   iri: string;
   label: string;
   definition: string;
   visible: boolean;
   deletable: boolean;
+  editable: boolean;
 }
 
 export interface GraphNode {
@@ -63,7 +79,7 @@ export interface GraphNode {
   type: NodeType;
   name: string;
   description: string;
-  identification: string | null;
+  code: string | null;
   evaluation: string | null;
   support_agent_subtype: SupportAgentSubtype | null;
   graph: string;
@@ -94,7 +110,7 @@ export interface NodePayload {
   type: NodeType;
   name: string;
   description: string;
-  identification?: string;
+  code?: string;
   evaluation?: string;
   support_agent_subtype?: SupportAgentSubtype;
   parent?: { parent_id: string; relation: RelationType };
@@ -124,6 +140,13 @@ export const api = {
   logout: () => request<void>("/api/auth/logout", { method: "POST" }),
   me: () => request<User>("/api/auth/me"),
   users: () => request<User[]>("/api/users"),
+  teams: () => request<Team[]>("/api/teams"),
+  createTeam: (body: { name: string; member_ids: string[] }) =>
+    request<Team>("/api/teams", { method: "POST", body: JSON.stringify(body) }),
+  updateTeam: (teamId: string, body: { name: string; member_ids: string[] }) =>
+    request<Team>(`/api/teams/${encodeURIComponent(teamId)}`, { method: "PUT", body: JSON.stringify(body) }),
+  deleteTeam: (teamId: string) => request<void>(`/api/teams/${encodeURIComponent(teamId)}`, { method: "DELETE" }),
+  leaveTeam: (teamId: string) => request<void>(`/api/teams/${encodeURIComponent(teamId)}/membership`, { method: "DELETE" }),
   createUser: (body: { username: string; display_name: string; password: string; role: UserRole }) =>
     request<User>("/api/users", {
       method: "POST",
@@ -155,6 +178,18 @@ export const api = {
     request<void>(`/api/concepts?concept_iri=${encodeURIComponent(iri)}`, {
       method: "DELETE"
     }),
+  conceptPermissions: (iri: string) =>
+    request<NodePermissionGrant[]>(`/api/concepts/permissions?concept_iri=${encodeURIComponent(iri)}`),
+  updateConceptPermissions: (iri: string, grants: NodePermissionGrant[]) =>
+    request<NodePermissionGrant[]>(`/api/concepts/permissions?concept_iri=${encodeURIComponent(iri)}`, {
+      method: "PUT",
+      body: JSON.stringify({ grants })
+    }),
+  addBulkConceptPermissions: (resourceIds: string[], grants: NodePermissionGrant[]) =>
+    request<void>("/api/concepts/permissions/bulk", {
+      method: "POST",
+      body: JSON.stringify({ resource_ids: resourceIds, grants })
+    }),
   graph: () => request<Snapshot>("/api/graph"),
   createNode: (body: NodePayload) =>
     request<GraphNode>("/api/nodes", { method: "POST", body: JSON.stringify(body) }),
@@ -167,6 +202,18 @@ export const api = {
     request<GraphNode>(`/api/nodes?node_id=${encodeURIComponent(nodeId)}`, {
       method: "PUT",
       body: JSON.stringify(body)
+    }),
+  nodePermissions: (nodeId: string) =>
+    request<NodePermissionGrant[]>(`/api/nodes/permissions?node_id=${encodeURIComponent(nodeId)}`),
+  updateNodePermissions: (nodeId: string, grants: NodePermissionGrant[]) =>
+    request<NodePermissionGrant[]>(`/api/nodes/permissions?node_id=${encodeURIComponent(nodeId)}`, {
+      method: "PUT",
+      body: JSON.stringify({ grants })
+    }),
+  addBulkNodePermissions: (resourceIds: string[], grants: NodePermissionGrant[]) =>
+    request<void>("/api/nodes/permissions/bulk", {
+      method: "POST",
+      body: JSON.stringify({ resource_ids: resourceIds, grants })
     }),
   createRelation: (body: { source: string; target: string; type: RelationType }) =>
     request<GraphRelation>("/api/relations", {

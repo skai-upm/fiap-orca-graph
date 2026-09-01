@@ -4,12 +4,12 @@ from secrets import token_urlsafe
 from uuid import uuid4
 
 from argon2 import PasswordHasher
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, delete, event, select, update
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, UniqueConstraint, delete, event, select, update
 from sqlalchemy.ext.asyncio import AsyncAttrs, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from .config import settings
-from .domain import UserPublic, UserRole
+from .domain import NodePermissionGrant, PermissionTargetType, Team, UserPublic, UserRole
 
 
 class Base(AsyncAttrs, DeclarativeBase):
@@ -53,6 +53,44 @@ class AppMetadataModel(Base):
 
     key: Mapped[str] = mapped_column(String(100), primary_key=True)
     value: Mapped[str] = mapped_column(String(500))
+
+
+class TeamModel(Base):
+    __tablename__ = "teams"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str] = mapped_column(String(200))
+    name_key: Mapped[str] = mapped_column(String(200), unique=True, index=True)
+
+
+class TeamMembershipModel(Base):
+    __tablename__ = "team_memberships"
+    __table_args__ = (UniqueConstraint("team_id", "user_id"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    team_id: Mapped[str] = mapped_column(ForeignKey("teams.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+
+
+class NodeGrantModel(Base):
+    __tablename__ = "node_grants"
+    __table_args__ = (UniqueConstraint("node_id", "target_type", "target_id"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    node_id: Mapped[str] = mapped_column(String(500), index=True)
+    owner_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    target_type: Mapped[str] = mapped_column(String(20))
+    target_id: Mapped[str] = mapped_column(String(36), index=True)
+
+
+class ConceptGrantModel(Base):
+    __tablename__ = "concept_grants"
+    __table_args__ = (UniqueConstraint("concept_iri", "target_type", "target_id"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    concept_iri: Mapped[str] = mapped_column(String(500), index=True)
+    target_type: Mapped[str] = mapped_column(String(20))
+    target_id: Mapped[str] = mapped_column(String(36), index=True)
 
 
 engine = create_async_engine(
@@ -283,6 +321,14 @@ async def delete_user_permanently(user_id: str) -> bool:
         await session.execute(
             delete(SessionModel).where(SessionModel.user_id == user_id)
         )
+        await session.execute(delete(NodeGrantModel).where(
+            (NodeGrantModel.owner_id == user_id)
+            | ((NodeGrantModel.target_type == PermissionTargetType.USER.value) & (NodeGrantModel.target_id == user_id))
+        ))
+        await session.execute(delete(ConceptGrantModel).where(
+            (ConceptGrantModel.target_type == PermissionTargetType.USER.value)
+            & (ConceptGrantModel.target_id == user_id)
+        ))
         await session.delete(model)
         await session.commit()
         return True
@@ -299,4 +345,189 @@ async def update_password(user_id: str, new_password: str) -> None:
             .where(SessionModel.user_id == user_id)
             .values(revoked=True)
         )
+        await session.commit()
+
+
+async def list_teams(user_id: str | None = None) -> list[Team]:
+    async with SessionFactory() as session:
+        teams = (await session.execute(select(TeamModel).order_by(TeamModel.name))).scalars().all()
+        result: list[Team] = []
+        for team in teams:
+            members = (await session.execute(
+                select(TeamMembershipModel.user_id).where(TeamMembershipModel.team_id == team.id)
+            )).scalars().all()
+            if user_id is None or user_id in members:
+                result.append(Team(id=team.id, name=team.name, member_ids=list(members)))
+        return result
+
+
+async def create_team(name: str, member_ids: list[str]) -> Team:
+    normalized = name.strip()
+    name_key = normalized.casefold()
+    async with SessionFactory() as session:
+        duplicate = await session.execute(select(TeamModel).where(TeamModel.name_key == name_key))
+        if duplicate.scalar_one_or_none() is not None:
+            raise ValueError("Ya existe un equipo con ese nombre")
+        active_ids = set((await session.execute(
+            select(UserModel.id).where(UserModel.id.in_(member_ids), UserModel.active.is_(True))
+        )).scalars().all()) if member_ids else set()
+        if active_ids != set(member_ids):
+            raise LookupError("Alguno de los usuarios seleccionados no existe")
+        team = TeamModel(id=str(uuid4()), name=normalized, name_key=name_key)
+        session.add(team)
+        await session.flush()
+        session.add_all([TeamMembershipModel(id=str(uuid4()), team_id=team.id, user_id=item) for item in member_ids])
+        await session.commit()
+        return Team(id=team.id, name=team.name, member_ids=member_ids)
+
+
+async def update_team(team_id: str, name: str, member_ids: list[str]) -> Team | None:
+    normalized = name.strip()
+    name_key = normalized.casefold()
+    async with SessionFactory() as session:
+        team = await session.get(TeamModel, team_id)
+        if team is None:
+            return None
+        duplicate = await session.execute(select(TeamModel).where(TeamModel.name_key == name_key, TeamModel.id != team_id))
+        if duplicate.scalar_one_or_none() is not None:
+            raise ValueError("Ya existe un equipo con ese nombre")
+        active_ids = set((await session.execute(
+            select(UserModel.id).where(UserModel.id.in_(member_ids), UserModel.active.is_(True))
+        )).scalars().all()) if member_ids else set()
+        if active_ids != set(member_ids):
+            raise LookupError("Alguno de los usuarios seleccionados no existe")
+        team.name = normalized
+        team.name_key = name_key
+        await session.execute(delete(TeamMembershipModel).where(TeamMembershipModel.team_id == team_id))
+        session.add_all([TeamMembershipModel(id=str(uuid4()), team_id=team_id, user_id=item) for item in member_ids])
+        await session.commit()
+        return Team(id=team.id, name=team.name, member_ids=member_ids)
+
+
+async def delete_team(team_id: str) -> bool:
+    async with SessionFactory() as session:
+        team = await session.get(TeamModel, team_id)
+        if team is None:
+            return False
+        await session.execute(delete(NodeGrantModel).where(NodeGrantModel.target_type == PermissionTargetType.TEAM.value, NodeGrantModel.target_id == team_id))
+        await session.execute(delete(ConceptGrantModel).where(ConceptGrantModel.target_type == PermissionTargetType.TEAM.value, ConceptGrantModel.target_id == team_id))
+        await session.delete(team)
+        await session.commit()
+        return True
+
+
+async def leave_team(team_id: str, user_id: str) -> bool:
+    async with SessionFactory() as session:
+        result = await session.execute(delete(TeamMembershipModel).where(TeamMembershipModel.team_id == team_id, TeamMembershipModel.user_id == user_id))
+        await session.commit()
+        return bool(result.rowcount)
+
+
+async def user_editable_node_ids(user_id: str) -> set[str]:
+    async with SessionFactory() as session:
+        team_ids = select(TeamMembershipModel.team_id).where(TeamMembershipModel.user_id == user_id)
+        statement = select(NodeGrantModel.node_id).where(
+            ((NodeGrantModel.target_type == PermissionTargetType.USER.value) & (NodeGrantModel.target_id == user_id))
+            | ((NodeGrantModel.target_type == PermissionTargetType.TEAM.value) & NodeGrantModel.target_id.in_(team_ids))
+        )
+        return set((await session.execute(statement)).scalars().all())
+
+
+async def node_permissions(node_id: str) -> list[NodePermissionGrant]:
+    async with SessionFactory() as session:
+        rows = (await session.execute(select(NodeGrantModel).where(NodeGrantModel.node_id == node_id))).scalars().all()
+        return [NodePermissionGrant(target_type=row.target_type, target_id=row.target_id) for row in rows]
+
+
+async def replace_node_permissions(node_id: str, owner_id: str, grants: list[NodePermissionGrant]) -> None:
+    async with SessionFactory() as session:
+        user_ids = [item.target_id for item in grants if item.target_type == PermissionTargetType.USER]
+        team_ids = [item.target_id for item in grants if item.target_type == PermissionTargetType.TEAM]
+        valid_users = set((await session.execute(select(UserModel.id).where(UserModel.id.in_(user_ids), UserModel.active.is_(True)))).scalars().all()) if user_ids else set()
+        valid_teams = set((await session.execute(select(TeamModel.id).where(TeamModel.id.in_(team_ids)))).scalars().all()) if team_ids else set()
+        if valid_users != set(user_ids) or valid_teams != set(team_ids):
+            raise LookupError("Algún usuario o equipo seleccionado ya no existe")
+        if owner_id in valid_users:
+            raise ValueError("El propietario ya tiene permisos sobre el nodo")
+        await session.execute(delete(NodeGrantModel).where(NodeGrantModel.node_id == node_id))
+        session.add_all([NodeGrantModel(id=str(uuid4()), node_id=node_id, owner_id=owner_id, target_type=item.target_type.value, target_id=item.target_id) for item in grants])
+        await session.commit()
+
+
+async def add_node_permissions_bulk(node_ids: list[str], owner_id: str, grants: list[NodePermissionGrant]) -> None:
+    async with SessionFactory() as session:
+        user_ids = [item.target_id for item in grants if item.target_type == PermissionTargetType.USER]
+        team_ids = [item.target_id for item in grants if item.target_type == PermissionTargetType.TEAM]
+        valid_users = set((await session.execute(select(UserModel.id).where(UserModel.id.in_(user_ids), UserModel.active.is_(True)))).scalars().all()) if user_ids else set()
+        valid_teams = set((await session.execute(select(TeamModel.id).where(TeamModel.id.in_(team_ids)))).scalars().all()) if team_ids else set()
+        if valid_users != set(user_ids) or valid_teams != set(team_ids):
+            raise LookupError("Algún usuario o equipo seleccionado ya no existe")
+        if owner_id in valid_users:
+            raise ValueError("El propietario ya tiene permisos sobre el nodo")
+        existing_rows = (await session.execute(select(NodeGrantModel).where(NodeGrantModel.node_id.in_(node_ids)))).scalars().all()
+        existing = {(row.node_id, row.target_type, row.target_id) for row in existing_rows}
+        session.add_all([
+            NodeGrantModel(id=str(uuid4()), node_id=node_id, owner_id=owner_id, target_type=grant.target_type.value, target_id=grant.target_id)
+            for node_id in node_ids for grant in grants
+            if (node_id, grant.target_type.value, grant.target_id) not in existing
+        ])
+        await session.commit()
+
+
+async def delete_node_permissions(node_id: str) -> None:
+    async with SessionFactory() as session:
+        await session.execute(delete(NodeGrantModel).where(NodeGrantModel.node_id == node_id))
+        await session.commit()
+
+
+async def user_editable_concept_iris(user_id: str) -> set[str]:
+    async with SessionFactory() as session:
+        team_ids = select(TeamMembershipModel.team_id).where(TeamMembershipModel.user_id == user_id)
+        statement = select(ConceptGrantModel.concept_iri).where(
+            ((ConceptGrantModel.target_type == PermissionTargetType.USER.value) & (ConceptGrantModel.target_id == user_id))
+            | ((ConceptGrantModel.target_type == PermissionTargetType.TEAM.value) & ConceptGrantModel.target_id.in_(team_ids))
+        )
+        return set((await session.execute(statement)).scalars().all())
+
+
+async def concept_permissions(concept_iri: str) -> list[NodePermissionGrant]:
+    async with SessionFactory() as session:
+        rows = (await session.execute(select(ConceptGrantModel).where(ConceptGrantModel.concept_iri == concept_iri))).scalars().all()
+        return [NodePermissionGrant(target_type=row.target_type, target_id=row.target_id) for row in rows]
+
+
+async def replace_concept_permissions(concept_iri: str, grants: list[NodePermissionGrant]) -> None:
+    async with SessionFactory() as session:
+        user_ids = [item.target_id for item in grants if item.target_type == PermissionTargetType.USER]
+        team_ids = [item.target_id for item in grants if item.target_type == PermissionTargetType.TEAM]
+        valid_users = set((await session.execute(select(UserModel.id).where(UserModel.id.in_(user_ids), UserModel.active.is_(True)))).scalars().all()) if user_ids else set()
+        valid_teams = set((await session.execute(select(TeamModel.id).where(TeamModel.id.in_(team_ids)))).scalars().all()) if team_ids else set()
+        if valid_users != set(user_ids) or valid_teams != set(team_ids):
+            raise LookupError("Algún usuario o equipo seleccionado ya no existe")
+        await session.execute(delete(ConceptGrantModel).where(ConceptGrantModel.concept_iri == concept_iri))
+        session.add_all([ConceptGrantModel(id=str(uuid4()), concept_iri=concept_iri, target_type=item.target_type.value, target_id=item.target_id) for item in grants])
+        await session.commit()
+
+
+async def add_concept_permissions_bulk(concept_iris: list[str], grants: list[NodePermissionGrant]) -> None:
+    async with SessionFactory() as session:
+        user_ids = [item.target_id for item in grants if item.target_type == PermissionTargetType.USER]
+        team_ids = [item.target_id for item in grants if item.target_type == PermissionTargetType.TEAM]
+        valid_users = set((await session.execute(select(UserModel.id).where(UserModel.id.in_(user_ids), UserModel.active.is_(True)))).scalars().all()) if user_ids else set()
+        valid_teams = set((await session.execute(select(TeamModel.id).where(TeamModel.id.in_(team_ids)))).scalars().all()) if team_ids else set()
+        if valid_users != set(user_ids) or valid_teams != set(team_ids):
+            raise LookupError("Algún usuario o equipo seleccionado ya no existe")
+        existing_rows = (await session.execute(select(ConceptGrantModel).where(ConceptGrantModel.concept_iri.in_(concept_iris)))).scalars().all()
+        existing = {(row.concept_iri, row.target_type, row.target_id) for row in existing_rows}
+        session.add_all([
+            ConceptGrantModel(id=str(uuid4()), concept_iri=concept_iri, target_type=grant.target_type.value, target_id=grant.target_id)
+            for concept_iri in concept_iris for grant in grants
+            if (concept_iri, grant.target_type.value, grant.target_id) not in existing
+        ])
+        await session.commit()
+
+
+async def delete_concept_permissions(concept_iri: str) -> None:
+    async with SessionFactory() as session:
+        await session.execute(delete(ConceptGrantModel).where(ConceptGrantModel.concept_iri == concept_iri))
         await session.commit()
